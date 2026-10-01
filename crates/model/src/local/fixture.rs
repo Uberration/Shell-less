@@ -131,6 +131,13 @@ pub const TOKENIZER_VOCAB: usize = 259 + TEXT_PIECES.len();
 /// and only the classifier row for `winner` is non-zero. For exercising
 /// stop tokens, limits and decoding deterministically.
 pub fn constant_prediction(winner: usize) -> Vec<u8> {
+    classifier_row(winner, 1.0)
+}
+
+/// [`constant_prediction`] with every weight in the winner's classifier row
+/// set to `value`. With `f32::MAX` the weights are finite but the logit
+/// overflows to infinity.
+pub fn classifier_row(winner: usize, value: f32) -> Vec<u8> {
     let (dim, hidden, layers, heads, vocab, seq) = (8usize, 8usize, 1usize, 2usize, TOKENIZER_VOCAB, 32usize);
     let head = dim / heads;
     let mut out = Vec::new();
@@ -157,7 +164,7 @@ pub fn constant_prediction(winner: usize) -> Vec<u8> {
         }
     }
     for row in 0..vocab {
-        put(dim, if row == winner { 1.0 } else { 0.0 }, &mut out);
+        put(dim, if row == winner { value } else { 0.0 }, &mut out);
     }
     out
 }

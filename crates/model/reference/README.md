@@ -43,16 +43,39 @@ on the reference platform the observed difference is exactly 0 at every
 position of both fixtures. The tolerance allows for `expf`/`powf`/`sinf`/
 `cosf` differing in the last bits on other platforms.
 
-## Deliberate tokenizer differences
+## The Shell-less legacy-v0 completion profile
 
-1. Text never becomes a special piece (ids 0–2) or a byte piece (3–258).
-   Upstream merges literal `"\n<s>\n"` into BOS and `"<0x41>"` into the
-   byte piece for `A` when the intermediate pieces exist. Both cases appear
-   in the fixture table. They do not occur with the real 32,000-piece vocabulary:
-   all 14 real encodings match upstream exactly.
-2. A byte piece decodes to its byte, including `<0x00>`. Upstream returns
-   C strings, so `<0x00>` decodes to an empty string there.
-3. Prompts containing NUL are rejected; upstream's C strings end at NUL.
+The file formats and the forward pass follow upstream. Tokenization and
+generation are Shell-less's own profile (`shell-less-legacy-v0-completion/2`).
+They agree with upstream except as listed, and that agreement is evidenced
+for the tested cases, not proven for every string.
+
+Tokenization:
+
+1. Ordinary vocabulary lookup and merging never turn literal special-token
+   spellings (`"\n<s>\n"`) or byte-piece spellings (`"<0x41>"`) into those
+   control or byte tokens; upstream does when the intermediate pieces exist
+   (both cases are in the fixture table). Actual UTF-8 byte fallback is
+   unchanged. With the real 32,000-piece vocabulary, all 14 tested
+   encodings match upstream exactly.
+2. Decoding keeps every byte, including `<0x00>`; upstream's C strings drop it.
+3. Prompts containing NUL are not accepted.
+
+Generation:
+
+| selected token | upstream `generate` | this profile |
+|---|---|---|
+| BOS (1) | stops | finish `stop`, no text |
+| EOS (2) | prints `"\n</s>\n"`, continues | finish `stop`, no text (extension) |
+| UNK (0) | prints `"<unk>"`, continues | the invocation fails |
+
+* Non-finite logits fail the invocation before selection.
+* Output bytes are assembled across tokens; invalid or incomplete UTF-8
+  becomes U+FFFD, and the output byte limit holds after that repair.
+* `usage.output_tokens` counts selections, including a stop token and a
+  token whose text did not fit.
+* The stored RoPE tables must match theta-10000 interleaved RoPE (tolerance
+  1e-3). Upstream ignores them; this is a strict profile check.
 
 ## Trained-model acceptance
 
@@ -62,11 +85,17 @@ with the `tokenizer.bin` above. Neither is checked in. With both provisioned:
 ```sh
 SHELL_LESS_CHECKPOINT=stories15M.bin SHELL_LESS_TOKENIZER=tokenizer.bin \
   cargo test -p model trained_stories15m -- --ignored --nocapture
+SHELL_LESS_CHECKPOINT=stories15M.bin SHELL_LESS_TOKENIZER=tokenizer.bin \
+  cargo test -p shell-less trained_model_through_a_graph -- --ignored --nocapture
 SHELL_LESS_TOKENIZER=tokenizer.bin cargo test -p model real_tokenizer -- --ignored
 
 cargo run -p shell-less -- run --checkpoint stories15M.bin --tokenizer tokenizer.bin \
   --show-outputs story.meat.yaml
 ```
+
+Record the reported revision (artifact fingerprints), the prompt token ids,
+the continuation, usage, finish reason and the committed graph output. A
+missing artifact fails these tests; it never passes them.
 
 To compare a continuation with upstream, run `run.c` with temperature 0 (greedy):
 `./run stories15M.bin -t 0 -n <steps> -i "Once upon a time"`. Upstream

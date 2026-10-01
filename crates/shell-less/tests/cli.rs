@@ -249,7 +249,7 @@ fn host_mounts_validated_local_model() {
     assert_eq!(out.code, 0, "{}", out.all());
     assert!(
         out.stdout
-            .contains("declared Effectful + Nondeterministic  shell-less/llama2c-v0-f32-scalar@1;checkpoint=fnv1a64:"),
+            .contains("declared Effectful + Nondeterministic  shell-less/llama2c-v0-f32-scalar@shell-less-legacy-v0-completion/2;checkpoint=fnv1a64:"),
         "{}",
         out.stdout
     );
@@ -296,4 +296,22 @@ fn artifacts_come_as_a_pair() {
     let (c, _) = fixture_artifacts("lonely", &good_checkpoint());
     let out = on_source("story-lonely.meat.yaml", STORY, "run", &["--checkpoint", &c]);
     assert_eq!(out.code, 2);
+}
+
+/// The trained-model acceptance run through a graph: the committed write and
+/// explicit output. Needs `SHELL_LESS_CHECKPOINT` and `SHELL_LESS_TOKENIZER`;
+/// run with `--ignored --nocapture`. Missing artifacts fail the test.
+#[test]
+#[ignore]
+fn trained_model_through_a_graph() {
+    let checkpoint = std::env::var("SHELL_LESS_CHECKPOINT").expect("set SHELL_LESS_CHECKPOINT");
+    let tokenizer = std::env::var("SHELL_LESS_TOKENIZER").expect("set SHELL_LESS_TOKENIZER");
+    let story = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/story.meat.yaml");
+    let args = ["run", "--seed", "1", "--checkpoint", &checkpoint, "--tokenizer", &tokenizer, "--show-outputs", story];
+    let out = shell_less(&args);
+    eprintln!("{}", out.all());
+    assert_eq!(out.code, 0);
+    assert!(out.stdout.contains("transaction Committed"));
+    let outputs = out.stdout.split("── outputs").nth(1).expect("outputs section");
+    assert!(outputs.contains(r#""input_tokens":5"#), "{outputs}");
 }

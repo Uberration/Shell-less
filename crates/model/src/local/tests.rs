@@ -322,20 +322,21 @@ fn response(text: &str, input_tokens: i64, output_tokens: i64, finish: FinishRea
     .into_value()
 }
 
+fn with_winner(checkpoint: Vec<u8>, limits: LocalLimits) -> (MeatFs, meatfs::GrantSet, meatfs::ObjectId) {
+    mounted(LocalModel::from_bytes(&checkpoint, &fixture::tokenizer(), limits).unwrap())
+}
+
 #[test]
 fn stopping_and_limits_are_explicit() {
-    let tok = fixture::tokenizer();
-    let with = |winner: usize, limits: LocalLimits| {
-        mounted(LocalModel::from_bytes(&fixture::constant_prediction(winner), &tok, limits).unwrap())
-    };
+    let with = |winner: usize, limits: LocalLimits| with_winner(fixture::constant_prediction(winner), limits);
     let limits = LocalLimits::default();
 
-    // BOS is the profile's delimiter; EOS and UNK also end generation. None
-    // of them is emitted, and none counts as an output token.
-    for stop in [1usize, 2, 0] {
+    // BOS (the profile's delimiter) and EOS (a documented extension) stop
+    // without text. The selection still counts as generation work.
+    for stop in [1usize, 2] {
         let (fs, host, id) = with(stop, limits);
         let out = infer(&fs, &host, id, request(&[("user", "a")], Some(8))).unwrap();
-        assert_eq!(out, response("", 2, 0, FinishReason::Stop), "stop token {stop}");
+        assert_eq!(out, response("", 2, 1, FinishReason::Stop), "stop token {stop}");
     }
 
     // A text token repeats until max_tokens: finish length. Prompt "a" is
@@ -343,18 +344,65 @@ fn stopping_and_limits_are_explicit() {
     let (fs, host, id) = with(294, limits);
     let out = infer(&fs, &host, id, request(&[("user", "a")], Some(4))).unwrap();
     assert_eq!(out, response("aaaa", 2, 4, FinishReason::Length));
-    // The output byte limit also ends generation with finish length.
+    // The output byte limit also ends generation with finish length; the
+    // fourth selection was made, so it is counted, though its text did not fit.
     let (fs, host, id) = with(294, LocalLimits { max_output_bytes: 3, ..limits });
     let out = infer(&fs, &host, id, request(&[("user", "a")], Some(10))).unwrap();
-    assert_eq!(out, response("aaa", 2, 3, FinishReason::Length));
+    assert_eq!(out, response("aaa", 2, 4, FinishReason::Length));
     // Empty prompt: BOS only, and the first piece follows BOS.
     let (fs, host, id) = with(295, limits);
     let out = infer(&fs, &host, id, request(&[("user", "")], Some(2))).unwrap();
     assert_eq!(out, response("a a", 1, 2, FinishReason::Length));
-    // Bytes that are not UTF-8 by the end are decoded lossily.
+    // Bytes that never form UTF-8 are repaired: invalid, then incomplete.
     let (fs, host, id) = with(0xE6 + 3, limits);
     let out = infer(&fs, &host, id, request(&[("user", "a")], Some(2))).unwrap();
-    assert_eq!(out.get("message").unwrap().get("content"), Some(&Value::from("\u{FFFD}\u{FFFD}")));
+    assert_eq!(out, response("\u{FFFD}\u{FFFD}", 2, 2, FinishReason::Length));
+}
+
+#[test]
+fn unk_and_non_finite_logits_fail_distinctly() {
+    let limits = LocalLimits::default();
+    // A selected UNK is a generation failure, not a successful stop.
+    let (fs, host, id) = with_winner(fixture::constant_prediction(0), limits);
+    let e = infer(&fs, &host, id, request(&[("user", "a")], Some(8))).unwrap_err();
+    assert_eq!(e, meatfs::Error::Capability { object: id, message: "generation selected UNK".into() });
+    // Finite weights, overflowing arithmetic: the logit is +inf. Caught
+    // before selection, and reported as a numerical failure.
+    let (fs, host, id) = with_winner(fixture::classifier_row(294, f32::MAX), limits);
+    let e = infer(&fs, &host, id, request(&[("user", "a")], Some(8))).unwrap_err();
+    assert_eq!(e, meatfs::Error::Capability { object: id, message: "non-finite logits".into() });
+    // The same overflow onto UNK's row is still numerical, not "UNK".
+    let (fs, host, id) = with_winner(fixture::classifier_row(0, f32::MAX), limits);
+    let e = infer(&fs, &host, id, request(&[("user", "a")], Some(8))).unwrap_err();
+    assert_eq!(e, meatfs::Error::Capability { object: id, message: "non-finite logits".into() });
+    assert_eq!(argmax(&[f32::NAN, 1.0]), None, "a NaN at index 0 is never the winner");
+    assert_eq!(argmax(&[1.0, 3.0, 3.0]), Some(1), "ties: lowest id");
+}
+
+#[test]
+fn the_byte_limit_holds_after_utf8_repair() {
+    // Every selection is byte 0xFF, which is never UTF-8: each becomes a
+    // three-byte U+FFFD, so small budgets must not be overrun.
+    let invalid = || fixture::constant_prediction(0xFF + 3);
+    for (budget, text, selections) in [(1, "", 1), (2, "", 1), (3, "\u{FFFD}", 2), (7, "\u{FFFD}\u{FFFD}", 3)] {
+        let limits = LocalLimits { max_output_bytes: budget, ..LocalLimits::default() };
+        let (fs, host, id) = with_winner(invalid(), limits);
+        let out = infer(&fs, &host, id, request(&[("user", "a")], Some(8))).unwrap();
+        assert_eq!(out, response(text, 2, selections, FinishReason::Length), "budget {budget}");
+        assert!(text.len() <= budget);
+    }
+}
+
+#[test]
+fn working_memory_covers_the_output_buffer() {
+    let base = LocalLimits { max_working_bytes: 256 << 10, ..LocalLimits::default() };
+    let (fs, host, id) = mounted(fixture::model(base));
+    assert!(infer(&fs, &host, id, request(&[("user", "hello")], Some(4))).is_ok());
+    // The same request, but an output budget that the working-memory limit
+    // cannot hold: rejected before anything is allocated.
+    let (fs, host, id) = mounted(fixture::model(LocalLimits { max_output_bytes: 1 << 20, ..base }));
+    let e = infer(&fs, &host, id, request(&[("user", "hello")], Some(4))).unwrap_err();
+    assert!(matches!(e, meatfs::Error::InvalidInput { .. }));
 }
 
 #[test]
@@ -415,14 +463,16 @@ fn metadata_is_declared_conservatively_and_names_no_path() {
     assert_eq!((meta.purity, meta.determinism), (Purity::Effectful, Determinism::Nondeterministic));
     assert_eq!(meta.invocation.implementation.as_deref(), Some(IMPLEMENTATION));
     let revision = meta.invocation.revision.unwrap();
-    assert!(revision.starts_with("1;checkpoint=fnv1a64:") && revision.contains(";tokenizer=fnv1a64:"), "{revision}");
+    let prefix = format!("{PROFILE};checkpoint=fnv1a64:");
+    assert!(revision.starts_with(&prefix) && revision.contains(";tokenizer=fnv1a64:"), "{revision}");
     assert_eq!(model.config().vocab_size, fixture::TOKENIZER_VOCAB);
     let _: InferRequest = capability::FromValue::from_value(request(&[("user", "x")], Some(1))).unwrap();
 }
 
 /// The trained-model acceptance run. Needs host-provisioned artifacts:
 /// `SHELL_LESS_CHECKPOINT` (stories15M.bin) and `SHELL_LESS_TOKENIZER`
-/// (the matching tokenizer.bin). Run with `--ignored`.
+/// (the matching tokenizer.bin). Run with `--ignored --nocapture`. Missing
+/// artifacts fail the test; they never make it pass vacuously.
 #[test]
 #[ignore]
 fn trained_stories15m_generates_a_continuation() {
@@ -431,10 +481,18 @@ fn trained_stories15m_generates_a_continuation() {
     let model = LocalModel::load(checkpoint.as_ref(), tokenizer.as_ref(), LocalLimits::default()).unwrap();
     let c = model.config();
     assert_eq!((c.dim, c.n_layers, c.n_heads, c.vocab_size, c.seq_len), (288, 6, 6, 32000, 256), "stories15M");
+    let prompt = "Once upon a time";
+    let prompt_ids = model.prompt_tokens(prompt);
+    assert_eq!(prompt_ids, [1, 9038, 2501, 263, 931], "upstream encoding of the prompt");
+    let revision = model.meta().invocation.revision.unwrap();
     let (fs, host, id) = mounted(model);
-    let out = infer(&fs, &host, id, request(&[("user", "Once upon a time")], Some(48))).unwrap();
+    let out = infer(&fs, &host, id, request(&[("user", prompt)], Some(48))).unwrap();
     let text = out.get("message").unwrap().get("content").unwrap().as_text().unwrap().to_owned();
-    eprintln!("continuation: {text:?}\nusage: {}\nfinish: {}", out.get("usage").unwrap(), out.get("finish").unwrap());
+    eprintln!("revision: {revision}");
+    eprintln!("prompt token ids: {prompt_ids:?}");
+    eprintln!("continuation: {text:?}");
+    eprintln!("usage: {}", out.get("usage").unwrap());
+    eprintln!("finish: {}", out.get("finish").unwrap());
     assert!(!text.trim().is_empty());
-    assert_eq!(out.get("usage").unwrap().get("input_tokens"), Some(&Value::Int(5)), "[BOS, Once, upon, a, time]");
+    assert_eq!(out.get("usage").unwrap().get("input_tokens"), Some(&Value::Int(5)));
 }

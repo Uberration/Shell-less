@@ -8,13 +8,21 @@
 //! `<0x00>`–`<0xFF>`; the space piece `" "` must exist (dummy prefix).
 //!
 //! Encoding follows `run.c` `encode`: optional BOS, a dummy `" "` prefix for
-//! non-empty text, one lookup per UTF-8 code point with byte fallback
-//! (`byte + 3`), then repeated merging of the adjacent pair whose
-//! concatenation has the highest score (ties: leftmost). One deliberate
-//! difference: text never matches the special pieces (0–2) or the byte
-//! pieces (3–258), during lookup or merging. Upstream would merge literal
-//! text such as `"\n<s>\n"` into BOS when the intermediate pieces exist;
-//! sentencepiece itself never produces control or byte pieces from text.
+//! non-empty text, one vocabulary lookup per UTF-8 code point, byte
+//! fallback (`byte + 3`) for code points not in the vocabulary, then
+//! repeated merging of the adjacent pair whose concatenation has the
+//! highest score (ties: leftmost).
+//!
+//! Profile behaviour that differs from upstream:
+//!
+//! * Ordinary vocabulary lookup and merging never turn literal
+//!   special-token spellings (`"\n<s>\n"`) or byte-piece spellings
+//!   (`"<0x41>"`) into those control or byte tokens; upstream does when
+//!   the intermediate pieces exist. Actual UTF-8 byte fallback is
+//!   unchanged and still produces byte-token ids.
+//! * Decoding preserves every byte, including `<0x00>`; upstream's C
+//!   strings drop a NUL.
+//! * Prompts containing NUL are not accepted (enforced by the capability).
 
 use super::checkpoint::read_exact;
 use super::{Artifact, LocalError, LocalLimits};
@@ -36,9 +44,12 @@ const MAX_TOKEN_LENGTH: usize = 1024;
 pub(crate) struct Tokenizer {
     pieces: Vec<Vec<u8>>,
     scores: Vec<f32>,
-    /// Text pieces only (ids ≥ 259): what text may match.
+    /// Text pieces only (ids ≥ 259): what vocabulary lookup and merging may
+    /// produce. Byte pieces come only from byte fallback.
     lookup: HashMap<Vec<u8>, u32>,
     space: u32,
+    /// The declared longest piece: an upper bound on any decoded piece.
+    max_piece: usize,
 }
 
 fn invalid(reason: &'static str, token: Option<usize>) -> LocalError {
@@ -127,7 +138,7 @@ impl Tokenizer {
             }
         }
         let space = *lookup.get(b" ".as_slice()).ok_or(invalid("no space piece for the dummy prefix", None))?;
-        Ok((Tokenizer { pieces, scores, lookup, space }, hash.finish()))
+        Ok((Tokenizer { pieces, scores, lookup, space, max_piece: max_len }, hash.finish()))
     }
 
     /// Encode `text` with a leading BOS. `text` must not contain NUL, which
@@ -165,6 +176,10 @@ impl Tokenizer {
             tokens.remove(i + 1);
         }
         tokens
+    }
+
+    pub fn max_piece(&self) -> usize {
+        self.max_piece
     }
 
     /// The bytes `token` contributes after `prev`, per upstream `decode`: a
