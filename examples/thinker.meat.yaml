@@ -1,0 +1,30 @@
+# Milestone 4 acceptance A: a model is an ordinary capability.
+agent:
+  name: thinker
+
+authority:
+  - path: /models/mock/infer
+    rights: [invoke]
+
+  - path: /state/answer
+    rights: [write]
+
+flow:
+  - id: infer
+    invoke:
+      path: /models/mock/infer
+      input:
+        messages:
+          - role: system
+            content: uppercase
+          - role: user
+            content: meat
+
+  - id: store
+    write:
+      path: /state/answer
+      from: infer
+
+outputs:
+  answer:
+    from: store

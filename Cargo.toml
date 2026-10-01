@@ -12,4 +12,5 @@ meatfs = { path = "crates/meatfs" }
 meatyaml = { path = "crates/meatyaml" }
 capability = { path = "crates/capability" }
 runtime = { path = "crates/runtime" }
+model = { path = "crates/model" }
 yaml-rust2 = "0.10"

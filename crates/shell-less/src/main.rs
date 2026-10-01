@@ -85,6 +85,8 @@ fn boot(seed: Seed) -> meatfs::Result<(MeatFs, GrantSet)> {
     capability::mount(&fs, &root, &Path::parse("/tools/echo")?, Echo)?;
     capability::mount(&fs, &root, &Path::parse("/tools/text/upper")?, Upper)?;
     capability::mount(&fs, &root, &Path::parse("/tools/test/fail")?, Fail)?;
+    capability::mount(&fs, &root, &Path::parse("/models/mock/infer")?, model::MockModel)?;
+    capability::mount(&fs, &root, &Path::parse("/models/mock/fail")?, model::MockFail)?;
     fs.bind(&root, &Path::parse("/memory/context")?, Value::map([("text", Value::from("shell-less boot"))]))?;
     Ok((fs, host))
 }
@@ -93,6 +95,7 @@ fn boot(seed: Seed) -> meatfs::Result<(MeatFs, GrantSet)> {
 fn policy() -> meatfs::Result<Policy> {
     Ok(Policy::default()
         .allow(Path::parse("/tools")?, Rights::INVOKE | Rights::INSPECT)
+        .allow(Path::parse("/models")?, Rights::INVOKE | Rights::INSPECT)
         .allow(Path::parse("/memory")?, Rights::READ)
         .allow(Path::parse("/state")?, Rights::READ | Rights::WRITE))
 }
@@ -154,6 +157,14 @@ fn print_receipt(program: &Program, receipt: &ExecutionReceipt) {
             format!("{:?}", n.state),
             n.grant.short()
         );
+        if let Some(meta) = &n.capability {
+            let implementation = match (&meta.invocation.implementation, &meta.invocation.revision) {
+                (Some(i), Some(r)) => format!("  {i}@{r}"),
+                (Some(i), None) => format!("  {i}"),
+                _ => String::new(),
+            };
+            println!("                 {:?} + {:?}{implementation}", meta.purity, meta.determinism);
+        }
     }
     for e in &receipt.events {
         let node = e.cause.map(|c| c.node.to_string()).unwrap_or_default();

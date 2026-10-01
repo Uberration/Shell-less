@@ -9,3 +9,4 @@ meatfs.workspace = true
 meatyaml.workspace = true
 capability.workspace = true
 runtime.workspace = true
+model.workspace = true

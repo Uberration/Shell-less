@@ -78,6 +78,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "model"
+version = "0.1.0"
+dependencies = [
+ "capability",
+ "meatfs",
+]
+
+[[package]]
 name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -90,6 +98,7 @@ dependencies = [
  "capability",
  "meatfs",
  "meatyaml",
+ "model",
 ]
 
 [[package]]
@@ -111,6 +120,7 @@ dependencies = [
  "capability",
  "meatfs",
  "meatyaml",
+ "model",
  "runtime",
 ]
 

@@ -42,11 +42,15 @@ The IR is the contract. The Rust interpreter in `runtime` is its first backend. 
 | `capability` | Typed `Capability` trait with mandatory `CapabilityMeta { purity }` and structured `Fault`s. Pure capabilities receive no effects handle; effectful ones see only the grants attached to their node. |
 | `meatyaml` | Compiles to MEAT IR: `Graph { id, nodes, edges, outputs }`. `Data` edges carry values; `Order` edges are derived wherever node footprints (target + `uses`) conflict, or requested with `after:`. `previous`, labels and source order never reach the IR. |
 | `runtime` | `load` validates IR, issues one grant per use and projects grants per node. `execute` runs nodes as their dependencies succeed (ties → lowest `NodeId`), tracks `NodeState`, blocks dependents of a failure, commits or rolls back, and always returns an `ExecutionReceipt` with outputs, schedule, node records, events and a structured `ExecutionError`. |
+| `model` | The model contract: `InferRequest`/`InferResponse`, `Message`, `Role`, `InferParameters`, `FinishReason`, `Usage`, and the deterministic `MockModel`/`MockFail`. No providers, transport, loops or templating. The runtime does not depend on it. |
 | `shell-less` | Demonstration binary; prints the receipt the runtime produced. |
 
 ```sh
 cargo run -p shell-less -- run --seed 42 examples/butcher.meat.yaml     # branching graph, two outputs
 cargo run -p shell-less -- run --seed 42 examples/failure.meat.yaml     # A staged → failure → B blocked → rollback
+cargo run -p shell-less -- run --seed 42 examples/thinker.meat.yaml    # /models/mock/infer → /state/answer
+cargo run -p shell-less -- run --seed 42 examples/model-failure.meat.yaml
+cargo run -p shell-less -- run --seed 42 examples/fork.meat.yaml        # model branch beside a tool branch
 cargo run -p shell-less -- run --seed 42 examples/echo.meat.yaml
 cargo run -p shell-less -- check examples/escalate.meat.yaml            # rejected by the compiler: undeclared
 cargo run -p shell-less -- run examples/escalate-declared.meat.yaml     # rejected by host policy at load
@@ -59,3 +63,5 @@ cargo run -p shell-less -- run examples/escalate-declared.meat.yaml     # reject
 - **Atomicity.** Each execution is one transaction. If any node fails, every staged change is discarded. The audit journal still keeps the attempt (`staged`, `invoke failed`, `rolled back`).
 - **Authority.** It is checked at compile time (declared `authority`), at load time (host `Policy`, all-or-nothing) and at every operation (the presented grant). A capability can never reach grants attached to another node.
 - **Determinism.** The same graph, seed and initial state give an identical receipt.
+- **Capability properties.** `Purity` (may it touch state?) and `Determinism` (same inputs, same output?) are independent. `InvocationMeta { implementation, revision }` records which implementation produced a result, and receipts record it for every invocation.
+- **Models are capabilities.** A model is mounted at a path like `/models/<name>/infer` and invoked like anything else. Inference is declared `Effectful`, even for the deterministic mock, because real inference depends on weights, samplers, hardware and caches.

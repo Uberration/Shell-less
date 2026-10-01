@@ -1,9 +1,11 @@
 //! The first native capabilities. Pure, deterministic, no I/O.
 
-use crate::{Capability, CapabilityContext, CapabilityMeta, Fault, Fields, FromValue, IntoValue, Purity, Result};
+use crate::{
+    Capability, CapabilityContext, CapabilityMeta, Determinism, Fault, Fields, FromValue, IntoValue, Purity, Result,
+};
 use meatfs::Value;
 
-const PURE: CapabilityMeta = CapabilityMeta { purity: Purity::Pure };
+const PURE: CapabilityMeta = CapabilityMeta::new(Purity::Pure, Determinism::Deterministic);
 
 /// `{ text: text }`
 #[derive(Debug, Clone, PartialEq)]

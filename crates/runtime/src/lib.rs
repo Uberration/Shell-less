@@ -14,8 +14,8 @@
 //! ```
 
 use meatfs::{
-    Cause, Event, ExecutionId, GrantId, GrantSet, MeatFs, NodeGrant, NodeGrants, NodeId, ObjectId, Path, Policy,
-    PrincipalId, Purity, Rights, Target, Transaction, Value,
+    CapabilityMeta, Cause, Event, ExecutionId, GrantId, GrantSet, MeatFs, NodeGrant, NodeGrants, NodeId, ObjectId,
+    Path, Policy, PrincipalId, Purity, Rights, Target, Transaction, Value,
 };
 use meatyaml::{EdgeKind, Graph, GraphId, Op, Program};
 use std::collections::{BTreeMap, BTreeSet};
@@ -265,6 +265,11 @@ pub struct NodeRecord {
     pub object: Option<ObjectId>,
     pub grant: GrantId,
     pub uses: Vec<GrantId>,
+    /// For invocations: the capability's declared execution properties and
+    /// implementation provenance, as published by the invoked object.
+    pub capability: Option<CapabilityMeta>,
+    /// The data the node consumed, if it ran.
+    pub input: Option<Value>,
     pub output: Option<Value>,
     pub error: Option<ExecutionError>,
 }
@@ -320,6 +325,9 @@ impl Run<'_> {
         let access = grants.access(resolved.grant).expect("resolved grant is in the set");
         let access = access.caused_by(Cause { execution: self.execution, node: node.id });
         let input = self.input(i);
+        if !matches!(node.op, Op::Read(_)) {
+            self.records[i].input = Some(input.clone());
+        }
         let result = match (&node.op, &resolved.target) {
             (Op::Read(_), ResolvedTarget::Object(o)) => self.tx.read(&access, *o).map(|v| (Some(*o), v)),
             (Op::Invoke(_), ResolvedTarget::Object(o)) => {
@@ -395,6 +403,11 @@ pub fn execute(fs: &MeatFs, loaded: &Loaded) -> ExecutionReceipt {
             },
             grant: r.grant,
             uses: r.uses.iter().map(|u| u.grant).collect(),
+            capability: match (&node.op, &r.target) {
+                (Op::Invoke(_), ResolvedTarget::Object(o)) => fs.meta(*o),
+                _ => None,
+            },
+            input: None,
             output: None,
             error: None,
         })
@@ -497,7 +510,7 @@ pub fn execute(fs: &MeatFs, loaded: &Loaded) -> ExecutionReceipt {
 mod tests {
     use super::*;
     use capability::builtin::{Echo, Fail, Upper};
-    use capability::{Capability, CapabilityContext, CapabilityMeta, Fault};
+    use capability::{Capability, CapabilityContext, Determinism, Fault};
     use meatfs::{Access, EventKind, Seed};
     use meatyaml::{Edge, Graph, Node, WriteOp};
 
@@ -519,7 +532,7 @@ mod tests {
             "write input to attached paths"
         }
         fn meta(&self) -> CapabilityMeta {
-            CapabilityMeta { purity: Purity::Effectful }
+            CapabilityMeta::new(Purity::Effectful, Determinism::Deterministic)
         }
         fn invoke(&self, cx: &CapabilityContext<'_>, input: Value) -> Result<Value, Fault> {
             let fx = cx.effects()?;
@@ -544,6 +557,8 @@ mod tests {
         capability::mount(&fs, &r, &p("/tools/text/upper"), Upper).unwrap();
         capability::mount(&fs, &r, &p("/tools/test/fail"), Fail).unwrap();
         capability::mount(&fs, &r, &p("/tools/test/stamp"), Stamp).unwrap();
+        capability::mount(&fs, &r, &p("/models/mock/infer"), model::MockModel).unwrap();
+        capability::mount(&fs, &r, &p("/models/mock/fail"), model::MockFail).unwrap();
         fs.bind(&r, &p("/memory/context"), Value::map([("text", Value::from("boot"))])).unwrap();
         (fs, host)
     }
@@ -551,6 +566,7 @@ mod tests {
     fn policy() -> Policy {
         Policy::default()
             .allow(p("/tools"), Rights::INVOKE)
+            .allow(p("/models"), Rights::INVOKE)
             .allow(p("/memory"), Rights::READ)
             .allow(p("/state"), Rights::READ | Rights::WRITE)
     }
@@ -744,5 +760,84 @@ flow:
         let again = load(&fs, &policy(), &program).unwrap();
         assert_ne!(again.nodes()[0].grant, grant);
         assert!(execute(&fs, &again).succeeded());
+    }
+
+    const THINKER: &str = include_str!("../../../examples/thinker.meat.yaml");
+    const MODEL_FAILURE: &str = include_str!("../../../examples/model-failure.meat.yaml");
+    const FORK: &str = include_str!("../../../examples/fork.meat.yaml");
+
+    fn message(role: &str, content: &str) -> Value {
+        Value::map([("role", Value::from(role)), ("content", Value::from(content))])
+    }
+
+    #[test]
+    fn model_is_an_ordinary_capability() {
+        let (fs, host) = boot(42);
+        let receipt = run(&fs, THINKER).unwrap();
+        assert!(receipt.succeeded(), "{:?}", receipt.error);
+
+        let answer = Value::map([
+            ("message", message("assistant", "MEAT")),
+            ("usage", Value::map([("input_tokens", Value::Int(2)), ("output_tokens", Value::Int(1))])),
+            ("finish", Value::from("stop")),
+        ]);
+        assert_eq!(receipt.outputs, BTreeMap::from([("answer".into(), answer.clone())]));
+        let stored = fs.resolve(&p("/state/answer")).unwrap();
+        assert_eq!(fs.read(&root(&host), stored).unwrap(), answer);
+
+        // Resolved to the model's identity, holding exactly its own invoke grant.
+        let model = fs.resolve(&p("/models/mock/infer")).unwrap();
+        let infer = &receipt.nodes[0];
+        assert_eq!(infer.object, Some(model));
+        assert!(infer.uses.is_empty());
+        let grant = receipt.grants.iter().find(|g| g.grant == infer.grant).unwrap();
+        assert_eq!((&grant.target, grant.rights), (&Target::Object(model), Rights::INVOKE));
+
+        // Provenance: input, declared properties and implementation.
+        let meta = infer.capability.clone().unwrap();
+        assert_eq!((meta.purity, meta.determinism), (Purity::Effectful, Determinism::Deterministic));
+        assert_eq!(meta.invocation.implementation.as_deref(), Some(model::MockModel::IMPLEMENTATION));
+        assert_eq!(meta.invocation.revision.as_deref(), Some(model::MockModel::REVISION));
+        let messages = infer.input.as_ref().unwrap().get("messages").unwrap();
+        assert_eq!(messages, &Value::List(vec![message("system", "uppercase"), message("user", "meat")]));
+
+        // Journaled like any invocation, caused by its node with its grant.
+        let invoked: Vec<_> = receipt.events.iter().filter(|e| e.object == model).map(|e| (&e.kind, e.grant)).collect();
+        assert_eq!(invoked, vec![(&EventKind::Invoked { ok: true }, Some(infer.grant))]);
+
+        assert_eq!(run(&boot(42).0, THINKER).unwrap(), receipt, "replayable with identical seed and implementation");
+    }
+
+    #[test]
+    fn model_failure_rolls_back() {
+        let (fs, host) = boot(42);
+        let before = snapshot(&fs, &host);
+        let receipt = run(&fs, MODEL_FAILURE).unwrap();
+        assert_eq!(snapshot(&fs, &host), before);
+        assert_eq!(receipt.transaction, TxOutcome::RolledBack);
+        let states: Vec<_> = receipt.nodes.iter().map(|n| n.state).collect();
+        assert_eq!(states, [NodeState::Succeeded, NodeState::Failed, NodeState::Blocked]);
+        let error = receipt.error.unwrap();
+        let fail = fs.resolve(&p("/models/mock/fail")).unwrap();
+        assert_eq!(
+            (error.node, error.object, error.grant, error.kind),
+            (Some(NodeId(1)), Some(fail), Some(receipt.nodes[1].grant), ExecutionErrorKind::CapabilityFailed)
+        );
+    }
+
+    #[test]
+    fn model_branch_is_independent_of_tool_branch() {
+        let (fs, _) = boot(42);
+        let program = meatyaml::compile(FORK).unwrap();
+        // tool → store_tool and model → store_model, nothing across.
+        let edges: Vec<_> = program.graph.edges.iter().map(|e| (e.from.0, e.to.0, e.kind)).collect();
+        assert_eq!(edges, vec![(0, 2, EdgeKind::Data), (1, 3, EdgeKind::Data)]);
+
+        let receipt = execute(&fs, &load(&fs, &policy(), &program).unwrap());
+        assert!(receipt.succeeded());
+        assert_eq!(receipt.outputs["tool"], text("MEAT"));
+        assert_eq!(receipt.outputs["model"].get("message"), Some(&message("assistant", "MEAT")));
+        assert_eq!(receipt.nodes[0].capability.as_ref().unwrap().purity, Purity::Pure);
+        assert_eq!(receipt.nodes[1].capability.as_ref().unwrap().purity, Purity::Effectful);
     }
 }

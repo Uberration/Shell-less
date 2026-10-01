@@ -22,8 +22,8 @@ pub use authority::{
 };
 pub use error::{Error, Result};
 pub use fs::{
-    CallContext, CapabilityMeta, Effects, Event, EventKind, Fault, Inspection, Invoke, MeatFs, NodeKind, Purity,
-    Subscription, Transaction,
+    CallContext, CapabilityMeta, Determinism, Effects, Event, EventKind, Fault, Inspection, InvocationMeta, Invoke,
+    MeatFs, NodeKind, Purity, Subscription, Transaction,
 };
 pub use id::{AuthorityDomainId, ExecutionId, GrantId, NodeId, ObjectId, PrincipalId, Seed};
 pub use path::Path;

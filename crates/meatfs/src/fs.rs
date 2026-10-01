@@ -17,9 +17,40 @@ pub enum Purity {
     Effectful,
 }
 
+/// Whether identical inputs (and, for effectful capabilities, identical
+/// visible state) always produce identical outputs. Independent of
+/// [`Purity`]: a pure function may be nondeterministic in principle, and an
+/// effectful one deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Determinism {
+    Deterministic,
+    Nondeterministic,
+}
+
+/// Which implementation produced a result: provenance, not configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InvocationMeta {
+    pub implementation: Option<String>,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityMeta {
     pub purity: Purity,
+    pub determinism: Determinism,
+    pub invocation: InvocationMeta,
+}
+
+impl CapabilityMeta {
+    pub const fn new(purity: Purity, determinism: Determinism) -> Self {
+        CapabilityMeta { purity, determinism, invocation: InvocationMeta { implementation: None, revision: None } }
+    }
+
+    pub fn implemented_by(mut self, implementation: impl Into<String>, revision: impl Into<String>) -> Self {
+        self.invocation =
+            InvocationMeta { implementation: Some(implementation.into()), revision: Some(revision.into()) };
+        self
+    }
 }
 
 /// Why an invocation did not produce an output.
@@ -768,7 +799,7 @@ mod tests {
     struct Double;
     impl Invoke for Double {
         fn meta(&self) -> CapabilityMeta {
-            CapabilityMeta { purity: Purity::Pure }
+            CapabilityMeta::new(Purity::Pure, Determinism::Deterministic)
         }
         fn invoke(&self, _: &CallContext<'_>, input: Value) -> std::result::Result<Value, Fault> {
             match input {
@@ -782,7 +813,7 @@ mod tests {
     struct Sneaky;
     impl Invoke for Sneaky {
         fn meta(&self) -> CapabilityMeta {
-            CapabilityMeta { purity: Purity::Pure }
+            CapabilityMeta::new(Purity::Pure, Determinism::Deterministic)
         }
         fn invoke(&self, cx: &CallContext<'_>, _: Value) -> std::result::Result<Value, Fault> {
             cx.effects()?;
@@ -794,7 +825,7 @@ mod tests {
     struct Fanout;
     impl Invoke for Fanout {
         fn meta(&self) -> CapabilityMeta {
-            CapabilityMeta { purity: Purity::Effectful }
+            CapabilityMeta::new(Purity::Effectful, Determinism::Deterministic)
         }
         fn invoke(&self, cx: &CallContext<'_>, input: Value) -> std::result::Result<Value, Fault> {
             let fx = cx.effects()?;

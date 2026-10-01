@@ -1,0 +1,42 @@
+# Milestone 4 acceptance C: a model branch beside an ordinary branch.
+# Neither branch references the other; the IR has no edge between them.
+agent:
+  name: fork
+
+authority:
+  - path: /tools/text/upper
+    rights: [invoke]
+  - path: /models/mock/infer
+    rights: [invoke]
+  - path: /state/fork
+    rights: [write]
+
+flow:
+  - id: tool
+    invoke:
+      path: /tools/text/upper
+      input: { text: meat }
+
+  - id: model
+    invoke:
+      path: /models/mock/infer
+      input:
+        messages:
+          - { role: system, content: uppercase }
+          - { role: user, content: meat }
+
+  - id: store_tool
+    write:
+      path: /state/fork/tool
+      from: tool
+
+  - id: store_model
+    write:
+      path: /state/fork/model
+      from: model
+
+outputs:
+  tool:
+    from: store_tool
+  model:
+    from: store_model

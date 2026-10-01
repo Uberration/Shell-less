@@ -1,13 +1,9 @@
 [package]
-name = "runtime"
+name = "model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 meatfs.workspace = true
-meatyaml.workspace = true
-
-[dev-dependencies]
 capability.workspace = true
-model.workspace = true

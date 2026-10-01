@@ -11,7 +11,7 @@ use meatfs::{Access, Invoke, MeatFs, ObjectId, Path, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub use meatfs::{CallContext as CapabilityContext, CapabilityMeta, Fault, Purity};
+pub use meatfs::{CallContext as CapabilityContext, CapabilityMeta, Determinism, Fault, InvocationMeta, Purity};
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -58,6 +58,7 @@ impl<C: Capability> Invoke for Typed<C> {
         Value::map([
             ("describe", Value::from(self.0.describe())),
             ("pure", Value::Bool(self.0.meta().purity == Purity::Pure)),
+            ("deterministic", Value::Bool(self.0.meta().determinism == Determinism::Deterministic)),
             ("input", C::Input::schema()),
             ("output", C::Output::schema()),
         ])
@@ -83,6 +84,13 @@ impl Fields {
     pub fn take<T: FromValue>(&mut self, key: &str) -> Result<T> {
         let value = self.0.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
         T::from_value(value).map_err(|e| format!("field `{key}`: {e}"))
+    }
+
+    pub fn take_optional<T: FromValue>(&mut self, key: &str) -> Result<Option<T>> {
+        match self.0.remove(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => T::from_value(value).map(Some).map_err(|e| format!("field `{key}`: {e}")),
+        }
     }
 
     /// Reject unknown fields, so typos never silently pass.
@@ -121,6 +129,31 @@ macro_rules! scalar {
 scalar!(String, Text, "text");
 scalar!(i64, Int, "int");
 scalar!(bool, Bool, "bool");
+
+impl<T: FromValue> FromValue for Vec<T> {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::List(items) => items
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| T::from_value(v).map_err(|e| format!("[{i}]: {e}")))
+                .collect(),
+            other => Err(format!("expected list, got {}", other.kind())),
+        }
+    }
+    fn schema() -> Value {
+        Value::List(vec![T::schema()])
+    }
+}
+
+impl<T: IntoValue> IntoValue for Vec<T> {
+    fn into_value(self) -> Value {
+        Value::List(self.into_iter().map(IntoValue::into_value).collect())
+    }
+    fn schema() -> Value {
+        Value::List(vec![T::schema()])
+    }
+}
 
 impl FromValue for Value {
     fn from_value(value: Value) -> Result<Self> {
@@ -161,7 +194,7 @@ mod tests {
         assert_eq!(out, Value::map([("text", Value::from("MEAT"))]));
 
         let inspection = fs.inspect(&root, echo).unwrap();
-        assert_eq!(inspection.meta, Some(CapabilityMeta { purity: Purity::Pure }));
+        assert_eq!(inspection.meta, Some(CapabilityMeta::new(Purity::Pure, Determinism::Deterministic)));
         assert_eq!(inspection.signature.get("input"), Some(&Text::schema_value()));
     }
 

@@ -1,0 +1,29 @@
+# Milestone 4 acceptance B: a failing model rolls the graph back like any failure.
+agent:
+  name: doomed-thinker
+
+authority:
+  - path: /state
+    rights: [write]
+  - path: /models/mock/fail
+    rights: [invoke]
+
+flow:
+  - id: write_a
+    write:
+      path: /state/a
+      value: { text: A }
+
+  - id: infer
+    after: write_a
+    invoke:
+      path: /models/mock/fail
+      input:
+        messages:
+          - role: user
+            content: meat
+
+  - id: write_b
+    write:
+      path: /state/b
+      from: infer
