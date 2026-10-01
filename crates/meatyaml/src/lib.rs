@@ -31,6 +31,7 @@
 mod parse;
 
 use meatfs::{AuthorityRequest, NodeId, Path, Rights, Value};
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub use parse::compile;
@@ -46,10 +47,14 @@ pub struct Program {
 
 impl Program {
     /// The exact authority the graph needs: for each node in id order, its
-    /// target and then its `uses`, each a separate want.
+    /// target (if it has one) and then its `uses`, each a separate want.
+    /// `compose` nodes need no authority.
     pub fn request(&self) -> AuthorityRequest {
         self.graph.nodes.iter().fold(AuthorityRequest::new(&self.agent), |req, node| {
-            let req = req.want(node.op.target().clone(), node.op.rights());
+            let req = match node.op.target() {
+                Some(target) => req.want(target.clone(), node.op.rights()),
+                None => req,
+            };
             node.op.uses().iter().fold(req, |req, u| req.want(u.path.clone(), u.rights))
         })
     }
@@ -81,7 +86,8 @@ impl fmt::Debug for GraphId {
 ///
 /// Execution order is defined only by `edges`:
 /// * a [`EdgeKind::Data`] edge feeds the source's output into the target's
-///   data input (at most one per node);
+///   data input. Each node has at most one, except a `compose` node, which
+///   has exactly one per distinct source its expression selects from;
 /// * a [`EdgeKind::Order`] edge requires the source to complete first.
 ///
 /// `NodeId`s carry no semantics beyond identity. A backend may run nodes in
@@ -119,6 +125,94 @@ pub enum Op {
     Read(ReadOp),
     Write(WriteOp),
     Invoke(InvokeOp),
+    Compose(ValueExpr),
+}
+
+/// A pure value constructor over literals and earlier outputs of the same
+/// execution. It reads no MeatFS state, invokes nothing and holds no
+/// grants. There is no interpolation, evaluation or implicit conversion.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueExpr {
+    /// Exactly this value.
+    Literal(Value),
+    /// A part of `source`'s output; an empty path selects all of it.
+    Select {
+        source: NodeId,
+        path: Vec<Selector>,
+    },
+    Map(BTreeMap<String, ValueExpr>),
+    List(Vec<ValueExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selector {
+    /// A field of a map.
+    Key(String),
+    /// An element of a list.
+    Index(usize),
+}
+
+impl ValueExpr {
+    /// Every node this expression selects from, ascending and deduplicated.
+    pub fn sources(&self) -> Vec<NodeId> {
+        fn walk(expr: &ValueExpr, out: &mut Vec<NodeId>) {
+            match expr {
+                ValueExpr::Literal(_) => {}
+                ValueExpr::Select { source, .. } => out.push(*source),
+                ValueExpr::Map(fields) => fields.values().for_each(|e| walk(e, out)),
+                ValueExpr::List(items) => items.iter().for_each(|e| walk(e, out)),
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Nesting depth; a leaf has depth 1.
+    pub fn depth(&self) -> usize {
+        match self {
+            ValueExpr::Literal(_) | ValueExpr::Select { .. } => 1,
+            ValueExpr::Map(fields) => 1 + fields.values().map(ValueExpr::depth).max().unwrap_or(0),
+            ValueExpr::List(items) => 1 + items.iter().map(ValueExpr::depth).max().unwrap_or(0),
+        }
+    }
+
+    /// Number of expression constructors.
+    pub fn count(&self) -> usize {
+        match self {
+            ValueExpr::Literal(_) | ValueExpr::Select { .. } => 1,
+            ValueExpr::Map(fields) => 1 + fields.values().map(ValueExpr::count).sum::<usize>(),
+            ValueExpr::List(items) => 1 + items.iter().map(ValueExpr::count).sum::<usize>(),
+        }
+    }
+
+    /// Unambiguous canonical encoding: constructor tags, literal values,
+    /// key/index distinctions and resolved node references.
+    fn canonical(&self) -> String {
+        match self {
+            ValueExpr::Literal(v) => format!("lit({v})"),
+            ValueExpr::Select { source, path } => {
+                let path: Vec<String> = path
+                    .iter()
+                    .map(|s| match s {
+                        Selector::Key(k) => format!("k{}", Value::from(k.as_str())),
+                        Selector::Index(i) => format!("i{i}"),
+                    })
+                    .collect();
+                format!("sel({source},[{}])", path.join(","))
+            }
+            ValueExpr::Map(fields) => {
+                let fields: Vec<String> =
+                    fields.iter().map(|(k, e)| format!("{}:{}", Value::from(k.as_str()), e.canonical())).collect();
+                format!("map{{{}}}", fields.join(","))
+            }
+            ValueExpr::List(items) => {
+                format!("list[{}]", items.iter().map(ValueExpr::canonical).collect::<Vec<_>>().join(","))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,11 +247,13 @@ pub struct Use {
 }
 
 impl Op {
-    pub fn target(&self) -> &Path {
+    /// The MeatFS name the node acts on; `None` for `compose`.
+    pub fn target(&self) -> Option<&Path> {
         match self {
             Op::Read(ReadOp { target }) | Op::Write(WriteOp { target, .. }) | Op::Invoke(InvokeOp { target, .. }) => {
-                target
+                Some(target)
             }
+            Op::Compose(_) => None,
         }
     }
 
@@ -166,6 +262,7 @@ impl Op {
             Op::Read(_) => Rights::READ,
             Op::Write(_) => Rights::WRITE,
             Op::Invoke(_) => Rights::INVOKE,
+            Op::Compose(_) => Rights::NONE,
         }
     }
 
@@ -174,13 +271,14 @@ impl Op {
             Op::Read(_) => "read",
             Op::Write(_) => "write",
             Op::Invoke(_) => "invoke",
+            Op::Compose(_) => "compose",
         }
     }
 
-    /// The literal data carried by the node itself, if any.
+    /// The literal data carried by a read, write or invoke node, if any.
     pub fn literal(&self) -> Option<&Value> {
         match self {
-            Op::Read(_) => None,
+            Op::Read(_) | Op::Compose(_) => None,
             Op::Write(WriteOp { value, .. }) => value.as_ref(),
             Op::Invoke(InvokeOp { input, .. }) => input.as_ref(),
         }
@@ -193,9 +291,10 @@ impl Op {
         }
     }
 
-    /// Every path the node may touch, with the rights it touches it with.
+    /// Every MeatFS path the node may touch, with the rights it touches it
+    /// with. Says nothing about effects outside MeatFS.
     pub fn footprint(&self) -> Vec<(&Path, Rights)> {
-        let mut footprint = vec![(self.target(), self.rights())];
+        let mut footprint: Vec<_> = self.target().map(|t| (t, self.rights())).into_iter().collect();
         footprint.extend(self.uses().iter().map(|u| (&u.path, u.rights)));
         footprint
     }
@@ -226,10 +325,16 @@ pub struct GraphOutput {
 /// Canonical text form of the semantic content of a graph. Labels are
 /// excluded; maps are already ordered, so equal graphs encode equally.
 fn canonical(nodes: &[Node], edges: &[Edge], outputs: &[GraphOutput]) -> String {
-    let mut out = String::from("meat-ir/2\n");
+    let mut out = String::from("meat-ir/3\n");
     for node in nodes {
-        let literal = node.op.literal().map(Value::to_string).unwrap_or_default();
-        out += &format!("node {} {} {} {}\n", node.id, node.op.name(), node.op.target(), literal);
+        let detail = match &node.op {
+            Op::Compose(expr) => expr.canonical(),
+            op => {
+                let literal = op.literal().map(Value::to_string).unwrap_or_default();
+                format!("{} {literal}", op.target().expect("non-compose ops have targets"))
+            }
+        };
+        out += &format!("node {} {} {detail}\n", node.id, node.op.name());
         for u in node.op.uses() {
             out += &format!("use {} {} {}\n", node.id, u.path, u.rights);
         }

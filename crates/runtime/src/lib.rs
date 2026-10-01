@@ -1,25 +1,93 @@
 //! The first MEAT IR backend: a deterministic, transactional Rust interpreter.
 //!
 //! ```text
-//! Program ──load──▶ Loaded ──execute──▶ ExecutionReceipt
+//! Program ──load──▶ Loaded ──execute──▶ ExecutionOutcome { outputs, receipt }
 //!            │                 │
-//!            │                 ├─ one MeatFS transaction per execution (graph-atomic)
+//!            │                 ├─ one MeatFS transaction per execution
 //!            │                 ├─ nodes run when their dependencies succeed; ties → lowest NodeId
-//!            │                 ├─ failure blocks dependents, then rolls everything back
-//!            │                 └─ every node acts only with the grants attached to it
+//!            │                 ├─ failure blocks dependents, then discards staged MeatFS changes
+//!            │                 ├─ every node acts only with the grants attached to it
+//!            │                 └─ the receipt keeps payloads only as the host's capture policy allows
 //!            │
-//!            ├─ validate IR structure
+//!            ├─ validate IR structure and host composition limits
 //!            ├─ AuthorityRequest → host Policy → GrantSet   (observational: no state changes)
-//!            └─ project grants per node: target grant + `uses` grants
+//!            ├─ project grants per node: target grant + `uses` grants
+//!            └─ order declared-effectful invocations conservatively (derived edges)
 //! ```
+//!
+//! # Atomicity boundary
+//!
+//! Atomicity covers MeatFS state only. Success commits staged MeatFS
+//! changes; failure discards them; the audit journal keeps both. Effects
+//! outside MeatFS — a request a backend already processed, a counter it
+//! already bumped — are not undone. An invocation that completed stays
+//! `Succeeded` even when the transaction rolls back, and a commit conflict is
+//! reported, never retried: retrying could invoke a model again.
+//!
+//! # Declared metadata
+//!
+//! Purity, determinism and implementation identity are what a capability
+//! *declares*. They are recorded as such and do not, on their own, justify
+//! caching, retries, speculative parallelism or claims of verified replay.
+//! Compiled-in capabilities are trusted host code; grants bound what they
+//! can do to MeatFS, not what arbitrary Rust can do.
+
+mod compose;
 
 use meatfs::{
-    CapabilityMeta, Cause, Event, ExecutionId, GrantId, GrantSet, MeatFs, NodeGrant, NodeGrants, NodeId, ObjectId,
-    Path, Policy, PrincipalId, Purity, Rights, Target, Transaction, Value,
+    CapabilityMeta, Cause, Event, EventKind, ExecutionId, GrantId, GrantSet, MeatFs, NodeGrant, NodeGrants, NodeId,
+    ObjectId, Path, Policy, PrincipalId, Purity, Rights, Target, Transaction, Value,
 };
 use meatyaml::{EdgeKind, Graph, GraphId, Op, Program};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+/// Host-controlled bounds on composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Deepest nesting of one `compose` expression.
+    pub max_depth: usize,
+    /// Most constructors in one `compose` expression.
+    pub max_exprs: usize,
+    /// Largest value one `compose` node may construct (see `compose::size`).
+    pub max_value_size: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { max_depth: 32, max_exprs: 4096, max_value_size: 1 << 20 }
+    }
+}
+
+/// What a receipt may retain of the values that flowed through an
+/// execution. Chosen by the host; no program or capability can raise it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContentCapture {
+    /// Keep identities, structure and statuses; drop every payload.
+    #[default]
+    Omit,
+    /// Keep payloads inline.
+    Inline,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CapturedValue {
+    Omitted,
+    Inline(Value),
+}
+
+impl ContentCapture {
+    fn value(self, value: &Value) -> CapturedValue {
+        match self {
+            ContentCapture::Omit => CapturedValue::Omitted,
+            ContentCapture::Inline => CapturedValue::Inline(value.clone()),
+        }
+    }
+
+    fn text(self, text: String) -> Option<String> {
+        (self == ContentCapture::Inline).then_some(text)
+    }
+}
 
 /// Why a program could not be loaded. Nothing has executed and the
 /// namespace is unchanged.
@@ -27,6 +95,8 @@ use std::fmt;
 pub enum LoadError {
     /// The IR violates a structural rule.
     InvalidGraph(String),
+    /// A composition exceeds host limits.
+    LimitExceeded(String),
     /// Authority resolution failed: policy denial, unbound name, …
     Authority(meatfs::Error),
 }
@@ -35,6 +105,7 @@ impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LoadError::InvalidGraph(m) => write!(f, "invalid graph: {m}"),
+            LoadError::LimitExceeded(m) => write!(f, "limit exceeded: {m}"),
             LoadError::Authority(e) => write!(f, "authority: {e}"),
         }
     }
@@ -48,6 +119,8 @@ pub enum ResolvedTarget {
     Object(ObjectId),
     /// An unbound name a write node will create when it executes.
     New(Path),
+    /// A `compose` node: it acts on nothing.
+    None,
 }
 
 /// A node with its statically resolved target and its exact authority.
@@ -55,8 +128,8 @@ pub enum ResolvedTarget {
 pub struct ResolvedNode {
     pub id: NodeId,
     pub target: ResolvedTarget,
-    /// The grant for the node's own operation.
-    pub grant: GrantId,
+    /// The grant for the node's own operation; `None` for `compose`.
+    pub grant: Option<GrantId>,
     /// Grants attached to an invocation: all its capability may use.
     pub uses: Vec<NodeGrant>,
 }
@@ -66,8 +139,11 @@ pub struct Loaded {
     graph: Graph,
     grants: GrantSet,
     nodes: Vec<ResolvedNode>,
+    /// Order edges the loader added between declared-effectful invocations.
+    derived: Vec<(NodeId, NodeId)>,
     preds: Vec<Vec<usize>>,
     succs: Vec<Vec<usize>>,
+    limits: Limits,
 }
 
 impl Loaded {
@@ -83,20 +159,26 @@ impl Loaded {
         &self.nodes
     }
 
+    pub fn derived_order(&self) -> &[(NodeId, NodeId)] {
+        &self.derived
+    }
+
     /// Revoke the graph's authority. It cannot run again.
     pub fn retire(self, fs: &MeatFs) {
         fs.retire(self.grants);
     }
 }
 
+type Adjacency = (Vec<Vec<usize>>, Vec<Vec<usize>>);
+
 /// Validate IR structure, returning predecessor and successor lists.
 ///
 /// Rules: node ids are dense and match their index; every edge joins two
-/// existing nodes; a node has at most one data input; reads and nodes with
-/// literal data have none; writes have data; outputs name existing nodes;
-/// the graph (data and order edges together) is acyclic.
-#[allow(clippy::type_complexity)]
-fn validate(graph: &Graph) -> Result<(Vec<Vec<usize>>, Vec<Vec<usize>>), LoadError> {
+/// existing nodes; a non-compose node has at most one data input, and none
+/// if it reads or carries literal data; writes have data; a compose node's
+/// data inputs are exactly the distinct sources it selects from; outputs
+/// name existing nodes; the graph is acyclic.
+fn validate(graph: &Graph) -> Result<Adjacency, LoadError> {
     let invalid = |m: String| Err(LoadError::InvalidGraph(m));
     let n = graph.nodes.len();
     for (i, node) in graph.nodes.iter().enumerate() {
@@ -106,65 +188,107 @@ fn validate(graph: &Graph) -> Result<(Vec<Vec<usize>>, Vec<Vec<usize>>), LoadErr
     }
     let mut preds = vec![Vec::new(); n];
     let mut succs = vec![Vec::new(); n];
-    let mut data_in = vec![false; n];
+    let mut data_in: Vec<Vec<NodeId>> = vec![Vec::new(); n];
     for edge in &graph.edges {
         let (from, to) = (edge.from.0 as usize, edge.to.0 as usize);
         if from >= n || to >= n {
             return invalid(format!("edge {} → {} leaves the graph", edge.from, edge.to));
         }
-        if edge.kind == EdgeKind::Data && std::mem::replace(&mut data_in[to], true) {
-            return invalid(format!("{} has more than one data input", edge.to));
+        if edge.kind == EdgeKind::Data {
+            data_in[to].push(edge.from);
         }
         preds[to].push(from);
         succs[from].push(to);
     }
-    for (node, &has_input) in graph.nodes.iter().zip(&data_in) {
-        match (&node.op, has_input) {
-            (Op::Read(_), true) => return invalid(format!("{} reads but has a data input", node.id)),
-            (op, true) if op.literal().is_some() => {
+    for (node, inputs) in graph.nodes.iter().zip(&mut data_in) {
+        inputs.sort_unstable();
+        match &node.op {
+            Op::Compose(expr) => {
+                if *inputs != expr.sources() {
+                    return invalid(format!("{}: data inputs do not match the sources it selects", node.id));
+                }
+            }
+            _ if inputs.len() > 1 => return invalid(format!("{} has more than one data input", node.id)),
+            Op::Read(_) if !inputs.is_empty() => return invalid(format!("{} reads but has a data input", node.id)),
+            op if op.literal().is_some() && !inputs.is_empty() => {
                 return invalid(format!("{} has both literal data and a data input", node.id))
             }
-            (Op::Write(w), false) if w.value.is_none() => return invalid(format!("{} writes nothing", node.id)),
+            Op::Write(w) if w.value.is_none() && inputs.is_empty() => {
+                return invalid(format!("{} writes nothing", node.id))
+            }
             _ => {}
         }
     }
     if let Some(o) = graph.outputs.iter().find(|o| o.source.0 as usize >= n) {
         return invalid(format!("output `{}` names missing node {}", o.name, o.source));
     }
-    let mut remaining: Vec<usize> = preds.iter().map(Vec::len).collect();
-    let mut ready: Vec<usize> = (0..n).filter(|&i| remaining[i] == 0).collect();
-    let mut seen = 0;
-    while let Some(i) = ready.pop() {
-        seen += 1;
-        for &s in &succs[i] {
-            remaining[s] -= 1;
-            if remaining[s] == 0 {
-                ready.push(s);
-            }
-        }
-    }
-    if seen != n {
+    if topological(&preds, &succs).len() != n {
         return invalid("graph has a cycle".to_owned());
     }
     Ok((preds, succs))
 }
 
-/// Resolve a program into an executable graph under host `policy`.
+/// Kahn's algorithm with lowest-index tie-break. Shorter than `n` on a cycle.
+fn topological(preds: &[Vec<usize>], succs: &[Vec<usize>]) -> Vec<usize> {
+    let mut remaining: Vec<usize> = preds.iter().map(Vec::len).collect();
+    let mut ready: BTreeSet<usize> = (0..preds.len()).filter(|&i| remaining[i] == 0).collect();
+    let mut order = Vec::with_capacity(preds.len());
+    while let Some(i) = ready.pop_first() {
+        order.push(i);
+        for &s in &succs[i] {
+            remaining[s] -= 1;
+            if remaining[s] == 0 {
+                ready.insert(s);
+            }
+        }
+    }
+    order
+}
+
+fn reaches(succs: &[Vec<usize>], from: usize, to: usize) -> bool {
+    let mut stack = vec![from];
+    let mut seen = vec![false; succs.len()];
+    while let Some(n) = stack.pop() {
+        if n == to {
+            return true;
+        }
+        if !std::mem::replace(&mut seen[n], true) {
+            stack.extend(&succs[n]);
+        }
+    }
+    false
+}
+
+/// Resolve a program into an executable graph under host `policy` and
+/// `limits`.
 ///
 /// Observational: on success or failure, the namespace is unchanged.
-pub fn load(fs: &MeatFs, policy: &Policy, program: &Program) -> Result<Loaded, LoadError> {
-    let (preds, succs) = validate(&program.graph)?;
+pub fn load(fs: &MeatFs, policy: &Policy, limits: Limits, program: &Program) -> Result<Loaded, LoadError> {
+    let (mut preds, mut succs) = validate(&program.graph)?;
+    for node in &program.graph.nodes {
+        if let Op::Compose(expr) = &node.op {
+            if expr.depth() > limits.max_depth || expr.count() > limits.max_exprs {
+                return Err(LoadError::LimitExceeded(format!("{}: composition too deep or too large", node.id)));
+            }
+        }
+    }
     let grants = fs.issue(policy, &program.request()).map_err(LoadError::Authority)?;
 
-    // `request()` lists, per node, its target then its uses; walk it in step.
+    // `request()` lists, per node, its target (if any) then its uses.
     let mut issued = grants.iter();
     let mut nodes = Vec::with_capacity(program.graph.nodes.len());
     for node in &program.graph.nodes {
-        let grant = issued.next().expect("one grant per want");
-        let target = match grant.target() {
-            Target::Object(o) => ResolvedTarget::Object(*o),
-            Target::Name(p) => ResolvedTarget::New(p.clone()),
-            Target::Namespace(_) => unreachable!("issue never grants namespaces"),
+        let (target, grant) = match node.op.target() {
+            None => (ResolvedTarget::None, None),
+            Some(_) => {
+                let grant = issued.next().expect("one grant per want");
+                let target = match grant.target() {
+                    Target::Object(o) => ResolvedTarget::Object(*o),
+                    Target::Name(p) => ResolvedTarget::New(p.clone()),
+                    Target::Namespace(_) => unreachable!("issue never grants namespaces"),
+                };
+                (target, Some(grant.id()))
+            }
         };
         let uses: Vec<NodeGrant> = node
             .op
@@ -177,10 +301,30 @@ pub fn load(fs: &MeatFs, policy: &Policy, program: &Program) -> Result<Loaded, L
                 return Err(LoadError::InvalidGraph(format!("{}: pure capability cannot be given `uses`", node.id)));
             }
         }
-        nodes.push(ResolvedNode { id: node.id, target, grant: grant.id(), uses });
+        nodes.push(ResolvedNode { id: node.id, target, grant, uses });
     }
     drop(issued);
-    Ok(Loaded { graph: program.graph.clone(), grants, nodes, preds, succs })
+
+    // Effects outside MeatFS are invisible to footprints, so invocations not
+    // declared pure are ordered among themselves, along a topological order
+    // of the IR (which keeps the graph acyclic).
+    let effectful: Vec<usize> = topological(&preds, &succs)
+        .into_iter()
+        .filter(|&i| match (&program.graph.nodes[i].op, &nodes[i].target) {
+            (Op::Invoke(_), ResolvedTarget::Object(o)) => fs.meta(*o).is_none_or(|m| m.purity != Purity::Pure),
+            _ => false,
+        })
+        .collect();
+    let mut derived = Vec::new();
+    for pair in effectful.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        if !reaches(&succs, from, to) {
+            preds[to].push(from);
+            succs[from].push(to);
+            derived.push((NodeId(from as u32), NodeId(to as u32)));
+        }
+    }
+    Ok(Loaded { graph: program.graph.clone(), grants, nodes, derived, preds, succs, limits })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +347,14 @@ pub enum ExecutionErrorKind {
     CapabilityFailed,
     DependencyFailed,
     TransactionConflict,
+    /// A composition selected a key that is not there.
+    MissingValue,
+    /// A composition selected through a value of the wrong kind.
+    WrongValueKind,
+    /// A composition selected past the end of a list.
+    IndexOutOfRange,
+    /// A composition exceeded a host limit.
+    LimitExceeded,
 }
 
 /// A structured failure: what failed, where, with which authority.
@@ -213,14 +365,19 @@ pub struct ExecutionError {
     pub object: Option<ObjectId>,
     pub grant: Option<GrantId>,
     pub kind: ExecutionErrorKind,
-    /// Human-readable context. Never needed to interpret the failure.
-    pub detail: String,
+    /// Human-readable context, which may echo content. Kept only under
+    /// [`ContentCapture::Inline`]; never needed to interpret the failure.
+    pub detail: Option<String>,
 }
 
 impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let node = self.node.map(|n| format!("{n}: ")).unwrap_or_default();
-        write!(f, "{node}{:?}: {}", self.kind, self.detail)
+        write!(f, "{node}{:?}", self.kind)?;
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
     }
 }
 
@@ -249,6 +406,15 @@ pub enum TxOutcome {
     RolledBack,
 }
 
+/// What became of the MeatFS changes a node staged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedChanges {
+    None,
+    Committed,
+    /// Discarded. Says nothing about effects outside MeatFS.
+    RolledBack,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrantRecord {
     pub grant: GrantId,
@@ -260,39 +426,44 @@ pub struct GrantRecord {
 pub struct NodeRecord {
     pub node: NodeId,
     pub op: &'static str,
+    /// Whether the node's own work completed. Independent of whether its
+    /// MeatFS changes were kept; see `staged`.
     pub state: NodeState,
     /// The object touched; for a creating write, the object it created.
     pub object: Option<ObjectId>,
-    pub grant: GrantId,
+    pub grant: Option<GrantId>,
     pub uses: Vec<GrantId>,
-    /// For invocations: the capability's declared execution properties and
-    /// implementation provenance, as published by the invoked object.
-    pub capability: Option<CapabilityMeta>,
-    /// The data the node consumed, if it ran.
-    pub input: Option<Value>,
-    pub output: Option<Value>,
+    /// For invocations: execution properties and implementation identity
+    /// as *declared* by the invoked object. Not verified.
+    pub declared: Option<CapabilityMeta>,
+    pub input: Option<CapturedValue>,
+    pub output: Option<CapturedValue>,
+    pub staged: StagedChanges,
     pub error: Option<ExecutionError>,
 }
 
-/// The substrate's record of one execution, successful or not.
+/// The substrate's audit record of one execution, successful or not.
 ///
 /// Connects execution → node → grant used → object touched → event
-/// produced. Deterministic plain data; attestation comes later.
+/// produced. Payloads appear only as the host's [`ContentCapture`] allows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionReceipt {
     pub execution: ExecutionId,
     pub graph: GraphId,
     pub principal: PrincipalId,
+    pub capture: ContentCapture,
     pub grants: Vec<GrantRecord>,
+    /// Order edges the loader added between declared-effectful invocations.
+    pub derived_order: Vec<(NodeId, NodeId)>,
     /// Every node, by `NodeId`.
     pub nodes: Vec<NodeRecord>,
     /// The order nodes actually ran in.
     pub schedule: Vec<NodeId>,
-    /// Audit events caused by this execution, including rolled-back work.
+    /// Audit events caused by this execution, including discarded work.
     pub events: Vec<Event>,
     pub transaction: TxOutcome,
-    /// Graph outputs; empty unless the transaction committed.
-    pub outputs: BTreeMap<String, Value>,
+    /// Graph outputs as captured; empty unless the transaction committed.
+    pub outputs: BTreeMap<String, CapturedValue>,
     /// The failure that rolled the execution back, if any.
     pub error: Option<ExecutionError>,
 }
@@ -303,11 +474,29 @@ impl ExecutionReceipt {
     }
 }
 
+/// The two products of an execution, kept apart: the actual graph outputs
+/// for the caller, and the receipt for the audit trail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionOutcome {
+    /// Graph outputs; empty unless the transaction committed.
+    pub outputs: BTreeMap<String, Value>,
+    pub receipt: ExecutionReceipt,
+}
+
+enum Failure {
+    Substrate(meatfs::Error),
+    Compose(compose::ComposeFault),
+}
+
 struct Run<'a> {
     loaded: &'a Loaded,
     tx: Transaction<'a>,
     execution: ExecutionId,
-    records: Vec<NodeRecord>,
+    capture: ContentCapture,
+    inputs: Vec<Option<Value>>,
+    outputs: Vec<Option<Value>>,
+    objects: Vec<Option<ObjectId>>,
+    errors: Vec<Option<ExecutionError>>,
 }
 
 impl Run<'_> {
@@ -315,18 +504,25 @@ impl Run<'_> {
         let node = &self.loaded.graph.nodes[i];
         match (node.op.literal(), self.loaded.graph.data_input(node.id)) {
             (Some(literal), _) => literal.clone(),
-            (None, Some(from)) => self.records[from.0 as usize].output.clone().expect("dependencies succeeded"),
+            (None, Some(from)) => self.outputs[from.0 as usize].clone().expect("dependencies succeeded"),
             (None, None) => Value::Null,
         }
     }
 
-    fn step(&mut self, i: usize) -> Result<(Option<ObjectId>, Value), meatfs::Error> {
+    fn step(&mut self, i: usize) -> Result<(Option<ObjectId>, Value), Failure> {
         let (node, resolved, grants) = (&self.loaded.graph.nodes[i], &self.loaded.nodes[i], &self.loaded.grants);
-        let access = grants.access(resolved.grant).expect("resolved grant is in the set");
+        if let Op::Compose(expr) = &node.op {
+            let outputs = &self.outputs;
+            let output = |n: NodeId| outputs[n.0 as usize].as_ref().expect("dependencies succeeded");
+            let mut budget = self.loaded.limits.max_value_size;
+            return compose::evaluate(expr, &output, &mut budget).map(|v| (None, v)).map_err(Failure::Compose);
+        }
+        let grant = resolved.grant.expect("non-compose nodes hold a grant");
+        let access = grants.access(grant).expect("resolved grant is in the set");
         let access = access.caused_by(Cause { execution: self.execution, node: node.id });
         let input = self.input(i);
         if !matches!(node.op, Op::Read(_)) {
-            self.records[i].input = Some(input.clone());
+            self.inputs[i] = Some(input.clone());
         }
         let result = match (&node.op, &resolved.target) {
             (Op::Read(_), ResolvedTarget::Object(o)) => self.tx.read(&access, *o).map(|v| (Some(*o), v)),
@@ -341,25 +537,32 @@ impl Run<'_> {
                 self.tx.create(&access, p, input.clone()).map(|o| (Some(o), input))
             }
             (_, ResolvedTarget::New(p)) => Err(meatfs::Error::Unbound(p.clone())),
+            (Op::Compose(_), _) | (_, ResolvedTarget::None) => unreachable!("compose returned above"),
         };
-        result
+        result.map_err(Failure::Substrate)
     }
 
-    /// Structure a substrate failure of node `i`.
-    fn failure(&self, i: usize, e: &meatfs::Error) -> ExecutionError {
+    /// Structure a failure of node `i`.
+    fn failure(&self, i: usize, failure: Failure) -> ExecutionError {
         let resolved = &self.loaded.nodes[i];
-        let (kind, object) = classify(e);
+        let (kind, object, detail) = match failure {
+            Failure::Substrate(e) => {
+                let (kind, object) = classify(&e);
+                (kind, object, e.to_string())
+            }
+            Failure::Compose(f) => (f.kind, None, f.detail),
+        };
         let object = object.or(match &resolved.target {
             ResolvedTarget::Object(o) => Some(*o),
-            ResolvedTarget::New(_) => None,
+            _ => None,
         });
         ExecutionError {
             execution: self.execution,
             node: Some(resolved.id),
             object,
-            grant: Some(resolved.grant),
+            grant: resolved.grant,
             kind,
-            detail: e.to_string(),
+            detail: self.capture.text(detail),
         }
     }
 
@@ -369,13 +572,13 @@ impl Run<'_> {
         while let Some(i) = stack.pop() {
             if states[i] != NodeState::Blocked {
                 states[i] = NodeState::Blocked;
-                self.records[i].error = Some(ExecutionError {
+                self.errors[i] = Some(ExecutionError {
                     execution: self.execution,
                     node: Some(self.loaded.nodes[i].id),
                     object: None,
-                    grant: Some(self.loaded.nodes[i].grant),
+                    grant: self.loaded.nodes[i].grant,
                     kind: ExecutionErrorKind::DependencyFailed,
-                    detail: format!("depends on failed {}", self.loaded.nodes[failed].id),
+                    detail: self.capture.text(format!("depends on failed {}", self.loaded.nodes[failed].id)),
                 });
                 stack.extend(&self.loaded.succs[i]);
             }
@@ -383,36 +586,29 @@ impl Run<'_> {
     }
 }
 
-/// Run a loaded graph inside one transaction: commit if every node
-/// succeeds, otherwise roll back. Always returns a receipt.
-pub fn execute(fs: &MeatFs, loaded: &Loaded) -> ExecutionReceipt {
+/// Run a loaded graph inside one MeatFS transaction: commit if every node
+/// succeeds, otherwise discard staged changes. Always produces a receipt,
+/// retaining payloads only as `capture` allows.
+pub fn execute(fs: &MeatFs, loaded: &Loaded, capture: ContentCapture) -> ExecutionOutcome {
     let execution = fs.new_execution();
     let n = loaded.graph.nodes.len();
-    let records = loaded
-        .graph
-        .nodes
-        .iter()
-        .zip(&loaded.nodes)
-        .map(|(node, r)| NodeRecord {
-            node: node.id,
-            op: node.op.name(),
-            state: NodeState::Pending,
-            object: match r.target {
+    let mut run = Run {
+        loaded,
+        tx: fs.transaction(),
+        execution,
+        capture,
+        inputs: vec![None; n],
+        outputs: vec![None; n],
+        objects: loaded
+            .nodes
+            .iter()
+            .map(|r| match r.target {
                 ResolvedTarget::Object(o) => Some(o),
-                ResolvedTarget::New(_) => None,
-            },
-            grant: r.grant,
-            uses: r.uses.iter().map(|u| u.grant).collect(),
-            capability: match (&node.op, &r.target) {
-                (Op::Invoke(_), ResolvedTarget::Object(o)) => fs.meta(*o),
                 _ => None,
-            },
-            input: None,
-            output: None,
-            error: None,
-        })
-        .collect();
-    let mut run = Run { loaded, tx: fs.transaction(), execution, records };
+            })
+            .collect(),
+        errors: vec![None; n],
+    };
 
     let mut states = vec![NodeState::Pending; n];
     let mut ready = BTreeSet::new();
@@ -431,413 +627,110 @@ pub fn execute(fs: &MeatFs, loaded: &Loaded) -> ExecutionReceipt {
         match run.step(i) {
             Ok((object, output)) => {
                 states[i] = NodeState::Succeeded;
-                run.records[i].object = object;
-                run.records[i].output = Some(output);
+                if object.is_some() {
+                    run.objects[i] = object;
+                }
+                run.outputs[i] = Some(output);
                 for &s in &loaded.succs[i] {
-                    if states[s] == NodeState::Pending
-                        && loaded.preds[s].iter().all(|&p| states[p] == NodeState::Succeeded)
-                    {
+                    let ready_now = loaded.preds[s].iter().all(|&p| states[p] == NodeState::Succeeded);
+                    if states[s] == NodeState::Pending && ready_now {
                         states[s] = NodeState::Ready;
                         ready.insert(s);
                     }
                 }
             }
-            Err(e) => {
-                let e = run.failure(i, &e);
+            Err(failure) => {
+                let e = run.failure(i, failure);
                 states[i] = NodeState::Failed;
-                run.records[i].error = Some(e.clone());
+                run.errors[i] = Some(e.clone());
                 run.block_dependents(i, &mut states);
                 error = Some(e);
                 break;
             }
         }
     }
-    for (record, state) in run.records.iter_mut().zip(&states) {
-        record.state = *state;
-    }
 
-    let Run { tx, records, .. } = run;
+    let Run { tx, inputs, outputs, objects, errors, .. } = run;
     let transaction = match error {
         Some(_) => {
             tx.rollback();
             TxOutcome::RolledBack
         }
+        // Never retried: the graph may already have invoked effectful work.
         None => match tx.commit() {
             Ok(()) => TxOutcome::Committed,
             Err(e) => {
                 let (kind, object) = classify(&e);
-                error =
-                    Some(ExecutionError { execution, node: None, object, grant: None, kind, detail: e.to_string() });
+                let detail = capture.text(e.to_string());
+                error = Some(ExecutionError { execution, node: None, object, grant: None, kind, detail });
                 TxOutcome::RolledBack
             }
         },
     };
 
-    let outputs = match transaction {
-        TxOutcome::Committed => loaded
-            .graph
-            .outputs
-            .iter()
-            .map(|o| (o.name.clone(), records[o.source.0 as usize].output.clone().expect("committed nodes all ran")))
-            .collect(),
-        TxOutcome::RolledBack => BTreeMap::new(),
-    };
     let events = loaded
         .grants
         .issued(0)
         .and_then(|g| loaded.grants.access(g.id()))
         .map(|a| a.caused_by(Cause { execution, node: NodeId(0) }))
         .map_or_else(Vec::new, |a| fs.execution_events(&a).expect("the set's own grant is live"));
-    ExecutionReceipt {
+    let staged_by: BTreeSet<NodeId> =
+        events.iter().filter(|e| e.kind == EventKind::Staged).filter_map(|e| e.cause.map(|c| c.node)).collect();
+
+    let graph_outputs: BTreeMap<String, Value> = match transaction {
+        TxOutcome::Committed => loaded
+            .graph
+            .outputs
+            .iter()
+            .map(|o| (o.name.clone(), outputs[o.source.0 as usize].clone().expect("committed nodes all ran")))
+            .collect(),
+        TxOutcome::RolledBack => BTreeMap::new(),
+    };
+    let nodes = (0..n)
+        .map(|i| {
+            let (node, resolved) = (&loaded.graph.nodes[i], &loaded.nodes[i]);
+            NodeRecord {
+                node: node.id,
+                op: node.op.name(),
+                state: states[i],
+                object: objects[i],
+                grant: resolved.grant,
+                uses: resolved.uses.iter().map(|u| u.grant).collect(),
+                declared: match (&node.op, &resolved.target) {
+                    (Op::Invoke(_), ResolvedTarget::Object(o)) => fs.meta(*o),
+                    _ => None,
+                },
+                input: inputs[i].as_ref().map(|v| capture.value(v)),
+                output: outputs[i].as_ref().map(|v| capture.value(v)),
+                staged: match (staged_by.contains(&node.id), transaction) {
+                    (false, _) => StagedChanges::None,
+                    (true, TxOutcome::Committed) => StagedChanges::Committed,
+                    (true, TxOutcome::RolledBack) => StagedChanges::RolledBack,
+                },
+                error: errors[i].clone(),
+            }
+        })
+        .collect();
+    let receipt = ExecutionReceipt {
         execution,
         graph: loaded.graph.id,
         principal: loaded.grants.principal(),
+        capture,
         grants: loaded
             .grants
             .iter()
             .map(|g| GrantRecord { grant: g.id(), target: g.target().clone(), rights: g.rights() })
             .collect(),
-        nodes: records,
+        derived_order: loaded.derived.clone(),
+        nodes,
         schedule,
         events,
         transaction,
-        outputs,
+        outputs: graph_outputs.iter().map(|(k, v)| (k.clone(), capture.value(v))).collect(),
         error,
-    }
+    };
+    ExecutionOutcome { outputs: graph_outputs, receipt }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use capability::builtin::{Echo, Fail, Upper};
-    use capability::{Capability, CapabilityContext, Determinism, Fault};
-    use meatfs::{Access, EventKind, Seed};
-    use meatyaml::{Edge, Graph, Node, WriteOp};
-
-    fn p(s: &str) -> Path {
-        Path::parse(s).unwrap()
-    }
-
-    const ECHO: &str = include_str!("../../../examples/echo.meat.yaml");
-    const BUTCHER: &str = include_str!("../../../examples/butcher.meat.yaml");
-    const FAILURE: &str = include_str!("../../../examples/failure.meat.yaml");
-
-    /// Effectful test capability: writes its input to every attached path,
-    /// and additionally to the path named by `{ also: "/..." }` if given.
-    struct Stamp;
-    impl Capability for Stamp {
-        type Input = Value;
-        type Output = Value;
-        fn describe(&self) -> &'static str {
-            "write input to attached paths"
-        }
-        fn meta(&self) -> CapabilityMeta {
-            CapabilityMeta::new(Purity::Effectful, Determinism::Deterministic)
-        }
-        fn invoke(&self, cx: &CapabilityContext<'_>, input: Value) -> Result<Value, Fault> {
-            let fx = cx.effects()?;
-            for entry in fx.grants() {
-                fx.write(&entry.path, input.clone())?;
-            }
-            if let Some(also) = input.get("also").and_then(Value::as_text) {
-                fx.write(&Path::parse(also)?, input.clone())?;
-            }
-            Ok(input)
-        }
-    }
-
-    fn root(host: &GrantSet) -> Access<'_> {
-        host.access(host.iter().next().unwrap().id()).unwrap()
-    }
-
-    fn boot(seed: u64) -> (MeatFs, GrantSet) {
-        let (fs, host) = MeatFs::genesis(Seed::fixed(seed));
-        let r = root(&host);
-        capability::mount(&fs, &r, &p("/tools/echo"), Echo).unwrap();
-        capability::mount(&fs, &r, &p("/tools/text/upper"), Upper).unwrap();
-        capability::mount(&fs, &r, &p("/tools/test/fail"), Fail).unwrap();
-        capability::mount(&fs, &r, &p("/tools/test/stamp"), Stamp).unwrap();
-        capability::mount(&fs, &r, &p("/models/mock/infer"), model::MockModel).unwrap();
-        capability::mount(&fs, &r, &p("/models/mock/fail"), model::MockFail).unwrap();
-        fs.bind(&r, &p("/memory/context"), Value::map([("text", Value::from("boot"))])).unwrap();
-        (fs, host)
-    }
-
-    fn policy() -> Policy {
-        Policy::default()
-            .allow(p("/tools"), Rights::INVOKE)
-            .allow(p("/models"), Rights::INVOKE)
-            .allow(p("/memory"), Rights::READ)
-            .allow(p("/state"), Rights::READ | Rights::WRITE)
-    }
-
-    fn snapshot(fs: &MeatFs, host: &GrantSet) -> Vec<(Path, ObjectId, Option<Value>)> {
-        fs.snapshot(&root(host), &Path::root()).unwrap()
-    }
-
-    fn run(fs: &MeatFs, src: &str) -> Result<ExecutionReceipt, LoadError> {
-        let program = meatyaml::compile(src).unwrap();
-        Ok(execute(fs, &load(fs, &policy(), &program)?))
-    }
-
-    fn text(s: &str) -> Value {
-        Value::map([("text", Value::from(s))])
-    }
-
-    #[test]
-    fn butcher_acceptance() {
-        let (fs, host) = boot(42);
-        let receipt = run(&fs, BUTCHER).unwrap();
-        assert!(receipt.succeeded(), "{:?}", receipt.error);
-        assert_eq!(receipt.outputs, BTreeMap::from([("upper".into(), text("MEAT")), ("echo".into(), text("MEAT"))]));
-        assert_eq!(receipt.schedule, [0, 1, 2, 3].map(NodeId));
-        assert!(receipt.nodes.iter().all(|n| n.state == NodeState::Succeeded));
-
-        // Objects created by the execution are recorded and visible.
-        let upper = fs.resolve(&p("/state/upper")).unwrap();
-        assert_eq!(receipt.nodes[2].object, Some(upper));
-        assert_eq!(fs.read(&root(&host), upper).unwrap(), text("MEAT"));
-        let written: Vec<_> = receipt
-            .events
-            .iter()
-            .filter(|e| matches!(e.kind, EventKind::Written { .. }))
-            .map(|e| (e.cause.unwrap().node, e.object, e.grant))
-            .collect();
-        assert_eq!(
-            written,
-            vec![
-                (NodeId(2), upper, Some(receipt.nodes[2].grant)),
-                (NodeId(3), receipt.nodes[3].object.unwrap(), Some(receipt.nodes[3].grant))
-            ]
-        );
-    }
-
-    #[test]
-    fn failure_rolls_back_and_blocks() {
-        let (fs, host) = boot(42);
-        let before = snapshot(&fs, &host);
-        let receipt = run(&fs, FAILURE).unwrap();
-
-        assert_eq!(snapshot(&fs, &host), before, "namespace unchanged");
-        assert_eq!(receipt.transaction, TxOutcome::RolledBack);
-        assert!(receipt.outputs.is_empty());
-        let states: Vec<_> = receipt.nodes.iter().map(|n| n.state).collect();
-        assert_eq!(states, [NodeState::Succeeded, NodeState::Failed, NodeState::Blocked]);
-        assert_eq!(receipt.nodes[2].error.as_ref().unwrap().kind, ExecutionErrorKind::DependencyFailed);
-
-        let error = receipt.error.unwrap();
-        let fail = fs.resolve(&p("/tools/test/fail")).unwrap();
-        assert_eq!(
-            (error.node, error.object, error.grant, error.kind),
-            (Some(NodeId(1)), Some(fail), Some(receipt.nodes[1].grant), ExecutionErrorKind::CapabilityFailed)
-        );
-
-        // The evidence survives: A was staged, the failure invoked, A rolled back.
-        let a = receipt.nodes[0].object.unwrap();
-        let kinds: Vec<_> = receipt.events.iter().map(|e| (e.object, e.kind.clone())).collect();
-        assert_eq!(
-            kinds,
-            vec![(a, EventKind::Staged), (fail, EventKind::Invoked { ok: false }), (a, EventKind::RolledBack)]
-        );
-    }
-
-    #[test]
-    fn loading_is_observational() {
-        let (fs, host) = boot(1);
-        let before = snapshot(&fs, &host);
-        load(&fs, &policy(), &meatyaml::compile(BUTCHER).unwrap()).unwrap();
-        let denied = load(&fs, &Policy::default(), &meatyaml::compile(BUTCHER).unwrap());
-        assert!(matches!(denied, Err(LoadError::Authority(meatfs::Error::PolicyDenied { .. }))));
-        assert_eq!(snapshot(&fs, &host), before);
-    }
-
-    #[test]
-    fn execution_is_deterministic() {
-        let a = run(&boot(7).0, BUTCHER).unwrap();
-        let b = run(&boot(7).0, BUTCHER).unwrap();
-        assert_eq!(a, b);
-        let f1 = run(&boot(7).0, FAILURE).unwrap();
-        let f2 = run(&boot(7).0, FAILURE).unwrap();
-        assert_eq!(f1, f2);
-    }
-
-    #[test]
-    fn scheduling_follows_edges_not_node_ids() {
-        let (fs, host) = boot(1);
-        let write = |id, value: i64| Node {
-            id: NodeId(id),
-            label: None,
-            op: Op::Write(WriteOp { target: p("/state/x"), value: Some(Value::Int(value)) }),
-        };
-        // n1 must precede n0: the final value is n0's.
-        let graph = Graph::new(
-            vec![write(0, 0), write(1, 1)],
-            vec![Edge { from: NodeId(1), to: NodeId(0), kind: EdgeKind::Order }],
-            vec![],
-        );
-        let program = Program { agent: "a".into(), authority: vec![], graph };
-        let receipt = execute(&fs, &load(&fs, &policy(), &program).unwrap());
-        assert_eq!(receipt.schedule, vec![NodeId(1), NodeId(0)]);
-        let x = fs.resolve(&p("/state/x")).unwrap();
-        assert_eq!(fs.read(&root(&host), x).unwrap(), Value::Int(0));
-    }
-
-    #[test]
-    fn capabilities_get_only_node_scoped_authority() {
-        let (fs, host) = boot(1);
-        let program = r#"
-agent: { name: a }
-authority:
-  - { path: /tools/test/stamp, rights: [invoke] }
-  - { path: /state, rights: [write] }
-flow:
-  - id: own
-    write: { path: /state/b, value: 0 }
-  - invoke:
-      path: /tools/test/stamp
-      input: { n: 1 }
-      uses: [{ path: /state/a, rights: [write] }]
-"#;
-        let receipt = run(&fs, program).unwrap();
-        assert!(receipt.succeeded(), "{:?}", receipt.error);
-        let a = fs.resolve(&p("/state/a")).unwrap();
-        assert_eq!(fs.read(&root(&host), a).unwrap(), Value::map([("n", Value::Int(1))]));
-
-        // The execution holds a grant for /state/b, but the stamp node does not.
-        let (fs, host) = boot(1);
-        let before = snapshot(&fs, &host);
-        let escalate = program.replace("input: { n: 1 }", "input: { also: /state/b }");
-        let receipt = run(&fs, &escalate).unwrap();
-        let error = receipt.error.unwrap();
-        assert_eq!((error.node, error.kind), (Some(NodeId(1)), ExecutionErrorKind::AuthorityDenied));
-        assert_eq!(snapshot(&fs, &host), before, "the stamp's own write rolled back too");
-    }
-
-    #[test]
-    fn pure_capabilities_cannot_be_given_uses() {
-        let (fs, _) = boot(1);
-        let e = run(
-            &fs,
-            r#"
-agent: { name: a }
-authority: [{ path: /tools, rights: [invoke] }, { path: /state, rights: [write] }]
-flow:
-  - invoke: { path: /tools/echo, input: { text: x }, uses: [{ path: /state/a, rights: [write] }] }
-"#,
-        );
-        assert!(matches!(e, Err(LoadError::InvalidGraph(_))));
-    }
-
-    #[test]
-    fn escalation_fails_at_policy() {
-        let (fs, _) = boot(1);
-        let e = run(&fs, include_str!("../../../examples/escalate-declared.meat.yaml")).err().unwrap();
-        assert_eq!(
-            e,
-            LoadError::Authority(meatfs::Error::PolicyDenied { path: p("/memory/context"), rights: Rights::WRITE })
-        );
-    }
-
-    #[test]
-    fn rejects_structurally_invalid_ir() {
-        let program = meatyaml::compile(ECHO).unwrap();
-        let mut cyclic = program.graph.clone();
-        cyclic.edges.push(Edge { from: NodeId(1), to: NodeId(0), kind: EdgeKind::Order });
-        assert!(matches!(validate(&cyclic), Err(LoadError::InvalidGraph(_))));
-
-        let mut double_input = program.graph.clone();
-        double_input.edges.push(Edge { from: NodeId(0), to: NodeId(1), kind: EdgeKind::Data });
-        assert!(matches!(validate(&double_input), Err(LoadError::InvalidGraph(_))));
-    }
-
-    #[test]
-    fn retired_graphs_cannot_run() {
-        let (fs, _) = boot(1);
-        let program = meatyaml::compile(ECHO).unwrap();
-        let loaded = load(&fs, &policy(), &program).unwrap();
-        let grant = loaded.nodes()[0].grant;
-        loaded.retire(&fs);
-        let again = load(&fs, &policy(), &program).unwrap();
-        assert_ne!(again.nodes()[0].grant, grant);
-        assert!(execute(&fs, &again).succeeded());
-    }
-
-    const THINKER: &str = include_str!("../../../examples/thinker.meat.yaml");
-    const MODEL_FAILURE: &str = include_str!("../../../examples/model-failure.meat.yaml");
-    const FORK: &str = include_str!("../../../examples/fork.meat.yaml");
-
-    fn message(role: &str, content: &str) -> Value {
-        Value::map([("role", Value::from(role)), ("content", Value::from(content))])
-    }
-
-    #[test]
-    fn model_is_an_ordinary_capability() {
-        let (fs, host) = boot(42);
-        let receipt = run(&fs, THINKER).unwrap();
-        assert!(receipt.succeeded(), "{:?}", receipt.error);
-
-        let answer = Value::map([
-            ("message", message("assistant", "MEAT")),
-            ("usage", Value::map([("input_tokens", Value::Int(2)), ("output_tokens", Value::Int(1))])),
-            ("finish", Value::from("stop")),
-        ]);
-        assert_eq!(receipt.outputs, BTreeMap::from([("answer".into(), answer.clone())]));
-        let stored = fs.resolve(&p("/state/answer")).unwrap();
-        assert_eq!(fs.read(&root(&host), stored).unwrap(), answer);
-
-        // Resolved to the model's identity, holding exactly its own invoke grant.
-        let model = fs.resolve(&p("/models/mock/infer")).unwrap();
-        let infer = &receipt.nodes[0];
-        assert_eq!(infer.object, Some(model));
-        assert!(infer.uses.is_empty());
-        let grant = receipt.grants.iter().find(|g| g.grant == infer.grant).unwrap();
-        assert_eq!((&grant.target, grant.rights), (&Target::Object(model), Rights::INVOKE));
-
-        // Provenance: input, declared properties and implementation.
-        let meta = infer.capability.clone().unwrap();
-        assert_eq!((meta.purity, meta.determinism), (Purity::Effectful, Determinism::Deterministic));
-        assert_eq!(meta.invocation.implementation.as_deref(), Some(model::MockModel::IMPLEMENTATION));
-        assert_eq!(meta.invocation.revision.as_deref(), Some(model::MockModel::REVISION));
-        let messages = infer.input.as_ref().unwrap().get("messages").unwrap();
-        assert_eq!(messages, &Value::List(vec![message("system", "uppercase"), message("user", "meat")]));
-
-        // Journaled like any invocation, caused by its node with its grant.
-        let invoked: Vec<_> = receipt.events.iter().filter(|e| e.object == model).map(|e| (&e.kind, e.grant)).collect();
-        assert_eq!(invoked, vec![(&EventKind::Invoked { ok: true }, Some(infer.grant))]);
-
-        assert_eq!(run(&boot(42).0, THINKER).unwrap(), receipt, "replayable with identical seed and implementation");
-    }
-
-    #[test]
-    fn model_failure_rolls_back() {
-        let (fs, host) = boot(42);
-        let before = snapshot(&fs, &host);
-        let receipt = run(&fs, MODEL_FAILURE).unwrap();
-        assert_eq!(snapshot(&fs, &host), before);
-        assert_eq!(receipt.transaction, TxOutcome::RolledBack);
-        let states: Vec<_> = receipt.nodes.iter().map(|n| n.state).collect();
-        assert_eq!(states, [NodeState::Succeeded, NodeState::Failed, NodeState::Blocked]);
-        let error = receipt.error.unwrap();
-        let fail = fs.resolve(&p("/models/mock/fail")).unwrap();
-        assert_eq!(
-            (error.node, error.object, error.grant, error.kind),
-            (Some(NodeId(1)), Some(fail), Some(receipt.nodes[1].grant), ExecutionErrorKind::CapabilityFailed)
-        );
-    }
-
-    #[test]
-    fn model_branch_is_independent_of_tool_branch() {
-        let (fs, _) = boot(42);
-        let program = meatyaml::compile(FORK).unwrap();
-        // tool → store_tool and model → store_model, nothing across.
-        let edges: Vec<_> = program.graph.edges.iter().map(|e| (e.from.0, e.to.0, e.kind)).collect();
-        assert_eq!(edges, vec![(0, 2, EdgeKind::Data), (1, 3, EdgeKind::Data)]);
-
-        let receipt = execute(&fs, &load(&fs, &policy(), &program).unwrap());
-        assert!(receipt.succeeded());
-        assert_eq!(receipt.outputs["tool"], text("MEAT"));
-        assert_eq!(receipt.outputs["model"].get("message"), Some(&message("assistant", "MEAT")));
-        assert_eq!(receipt.nodes[0].capability.as_ref().unwrap().purity, Purity::Pure);
-        assert_eq!(receipt.nodes[1].capability.as_ref().unwrap().purity, Purity::Effectful);
-    }
-}
+mod tests;

@@ -1,0 +1,52 @@
+# Milestone 4.1 acceptance: one source value feeds a tool and a model,
+# each adapted to its own input contract by a pure `compose`.
+agent:
+  name: composer
+
+authority:
+  - path: /tools/text/upper
+    rights: [invoke]
+  - path: /models/mock/infer
+    rights: [invoke]
+
+flow:
+  - id: source
+    compose:
+      literal:
+        text: meat
+
+  - id: upper
+    invoke:
+      path: /tools/text/upper
+      input:
+        from: source
+
+  - id: request
+    compose:
+      map:
+        messages:
+          list:
+            - map:
+                role:
+                  literal: system
+                content:
+                  literal: uppercase
+            - map:
+                role:
+                  literal: user
+                content:
+                  select:
+                    from: source
+                    path: [text]
+
+  - id: infer
+    invoke:
+      path: /models/mock/infer
+      input:
+        from: request
+
+outputs:
+  upper:
+    from: upper
+  answer:
+    from: infer

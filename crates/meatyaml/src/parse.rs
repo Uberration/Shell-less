@@ -1,4 +1,6 @@
-use crate::{Edge, EdgeKind, Error, Graph, GraphOutput, InvokeOp, Node, Op, Program, ReadOp, Use, WriteOp};
+use crate::{
+    Edge, EdgeKind, Error, Graph, GraphOutput, InvokeOp, Node, Op, Program, ReadOp, Selector, Use, ValueExpr, WriteOp,
+};
 use meatfs::{NodeId, Path, Rights, Value};
 use std::collections::{BTreeMap, HashMap};
 use yaml_rust2::{Yaml, YamlLoader};
@@ -131,6 +133,52 @@ impl Compiler {
         };
         let at = format!("{at}.{op_name}");
 
+        let (op, data_sources) = if op_name == "compose" {
+            let expr = self.expr(body, &at, previous)?;
+            let sources = expr.sources();
+            (Op::Compose(expr), sources)
+        } else {
+            self.operation(op_name, body, &at, previous)?
+        };
+
+        for (path, needed) in op.footprint() {
+            if !self.declared(path).contains(needed) {
+                return err(&at, format!("{path} needs `{needed}`, which is not declared in `authority`"));
+            }
+        }
+        for from in data_sources {
+            self.edges.push(Edge { from, to: id, kind: EdgeKind::Data });
+        }
+        if let Some(label) = &label {
+            if self.labels.insert(label.clone(), id).is_some() {
+                return err(at, format!("duplicate id `{label}`"));
+            }
+        }
+        self.nodes.push(Node { id, label, op });
+
+        // Order: preserve sequential semantics wherever footprints conflict,
+        // plus whatever the source asked for explicitly with `after`.
+        let node = &self.nodes[id.0 as usize];
+        // Latest first, so edges implied through a later node are skipped.
+        let mut required: Vec<NodeId> = self.nodes[..id.0 as usize]
+            .iter()
+            .filter(|earlier| conflicts(&earlier.op, &node.op))
+            .map(|earlier| earlier.id)
+            .chain(after)
+            .collect();
+        required.sort_unstable_by(|a, b| b.cmp(a));
+        required.dedup();
+        for earlier in required {
+            if !self.reaches(earlier, id) {
+                self.edges.push(Edge { from: earlier, to: id, kind: EdgeKind::Order });
+            }
+        }
+        Ok(())
+    }
+
+    /// A read, write or invoke step: the op and its data source, if any.
+    fn operation(&self, op_name: &str, body: &Yaml, at: &str, previous: Option<NodeId>) -> Result<(Op, Vec<NodeId>)> {
+        let at = at.to_owned();
         // Short form `op: /path` takes its data from the previous step.
         let (target, literal, from, uses) = match body {
             Yaml::String(_) => (path(body, &at)?, None, previous, Vec::new()),
@@ -180,42 +228,64 @@ impl Compiler {
             }
             other => return err(at, format!("unknown operation `{other}`")),
         };
+        // Reads take no input; literals need none.
+        let data = match (from, &op) {
+            (_, Op::Read(_)) => None,
+            (_, op) if op.literal().is_some() => None,
+            (from, _) => from,
+        };
+        Ok((op, data.into_iter().collect()))
+    }
 
-        for (path, needed) in op.footprint() {
-            if !self.declared(path).contains(needed) {
-                return err(&at, format!("{path} needs `{needed}`, which is not declared in `authority`"));
+    /// One composition expression: a map with exactly one constructor key.
+    fn expr(&self, yaml: &Yaml, at: &str, previous: Option<NodeId>) -> Result<ValueExpr> {
+        let map = Map::of(yaml, at)?;
+        let [(constructor, body)] = map.entries.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()[..] else {
+            return err(at, "an expression has exactly one of `literal`, `select`, `map`, `list`");
+        };
+        let at = format!("{at}.{constructor}");
+        match constructor {
+            "literal" => Ok(ValueExpr::Literal(value(body, &at)?)),
+            "select" => {
+                let mut select = Map::of(body, &at)?;
+                let source = self.reference(select.require("from")?, &format!("{at}.from"), previous)?;
+                let path = match select.optional("path") {
+                    None => Vec::new(),
+                    Some(Yaml::Array(items)) => items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| match item {
+                            Yaml::String(k) => Ok(Selector::Key(k.clone())),
+                            Yaml::Integer(n) if *n >= 0 => Ok(Selector::Index(*n as usize)),
+                            _ => err(format!("{at}.path[{i}]"), "expected a key (text) or index (non-negative int)"),
+                        })
+                        .collect::<Result<_>>()?,
+                    Some(_) => return err(format!("{at}.path"), "expected a list of keys and indexes"),
+                };
+                select.finish()?;
+                Ok(ValueExpr::Select { source, path })
             }
-        }
-
-        // Data: reads take no input; literals need none.
-        if let (Some(from), false, None) = (from, matches!(op, Op::Read(_)), op.literal()) {
-            self.edges.push(Edge { from, to: id, kind: EdgeKind::Data });
-        }
-        if let Some(label) = &label {
-            if self.labels.insert(label.clone(), id).is_some() {
-                return err(at, format!("duplicate id `{label}`"));
+            "map" => {
+                let fields = Map::of(body, &at)?;
+                let fields = fields
+                    .entries
+                    .iter()
+                    .map(|(k, v)| Ok(((*k).to_owned(), self.expr(v, &format!("{at}.{k}"), previous)?)))
+                    .collect::<Result<_>>()?;
+                Ok(ValueExpr::Map(fields))
             }
+            "list" => match body {
+                Yaml::Array(items) => Ok(ValueExpr::List(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| self.expr(item, &format!("{at}[{i}]"), previous))
+                        .collect::<Result<_>>()?,
+                )),
+                _ => err(at, "expected a list of expressions"),
+            },
+            other => err(at, format!("unknown constructor `{other}`")),
         }
-        self.nodes.push(Node { id, label, op });
-
-        // Order: preserve sequential semantics wherever footprints conflict,
-        // plus whatever the source asked for explicitly with `after`.
-        let node = &self.nodes[id.0 as usize];
-        // Latest first, so edges implied through a later node are skipped.
-        let mut required: Vec<NodeId> = self.nodes[..id.0 as usize]
-            .iter()
-            .filter(|earlier| conflicts(&earlier.op, &node.op))
-            .map(|earlier| earlier.id)
-            .chain(after)
-            .collect();
-        required.sort_unstable_by(|a, b| b.cmp(a));
-        required.dedup();
-        for earlier in required {
-            if !self.reaches(earlier, id) {
-                self.edges.push(Edge { from: earlier, to: id, kind: EdgeKind::Order });
-            }
-        }
-        Ok(())
     }
 
     fn reference(&self, from: &Yaml, at: &str, previous: Option<NodeId>) -> Result<NodeId> {
@@ -448,6 +518,78 @@ flow:
             (ECHO.replace("- id: store", "- id: make_meat"), "flow[1].write"),
             (ECHO.replace("  - id: store\n", "  - id: store\n    read: /x\n"), "flow[1]"),
             (ECHO.replace("from: store", "from: ghost"), "outputs.result.from"),
+        ];
+        for (src, at) in cases {
+            assert_eq!(compile(&src).unwrap_err().at, at, "{src}");
+        }
+    }
+
+    const COMPOSER: &str = include_str!("../../../examples/composer.meat.yaml");
+
+    #[test]
+    fn composer_shares_one_source_across_branches() {
+        let program = compile(COMPOSER).unwrap();
+        // source → upper, source → request → infer; nothing else.
+        assert_eq!(edges(&program), vec![(0, 1, EdgeKind::Data), (0, 2, EdgeKind::Data), (2, 3, EdgeKind::Data)]);
+        let Op::Compose(request) = &program.graph.nodes[2].op else { panic!("request is a compose") };
+        assert_eq!(request.sources(), vec![NodeId(0)]);
+        assert_eq!(program.request().wants.len(), 2, "compose needs no authority");
+    }
+
+    #[test]
+    fn literal_is_never_a_reference() {
+        let program = compile(
+            "agent: { name: a }\nflow:\n  - id: x\n    compose: { literal: 1 }\n  - compose:\n      literal:\n        from: x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            program.graph.nodes[1].op,
+            Op::Compose(ValueExpr::Literal(Value::map([("from", Value::from("x"))])))
+        );
+        assert!(program.graph.edges.is_empty());
+    }
+
+    #[test]
+    fn selectors_distinguish_keys_from_indexes() {
+        let src = |sel: &str| {
+            format!("agent: {{ name: a }}\nflow:\n  - id: s\n    compose: {{ literal: [1] }}\n  - compose: {{ select: {{ from: s, path: [{sel}] }} }}\n")
+        };
+        let key = compile(&src("\"0\"")).unwrap();
+        let index = compile(&src("0")).unwrap();
+        let Op::Compose(ValueExpr::Select { path, .. }) = &key.graph.nodes[1].op else { panic!() };
+        assert_eq!(path, &[Selector::Key("0".into())]);
+        let Op::Compose(ValueExpr::Select { path, .. }) = &index.graph.nodes[1].op else { panic!() };
+        assert_eq!(path, &[Selector::Index(0)]);
+        assert_ne!(key.graph.id, index.graph.id);
+    }
+
+    #[test]
+    fn composition_identity_and_errors() {
+        let base = compile(COMPOSER).unwrap().graph.id;
+        assert_eq!(compile(&COMPOSER.replace("source", "origin")).unwrap().graph.id, base, "labels are not identity");
+        assert_ne!(compile(&COMPOSER.replace("path: [text]", "path: [txt]")).unwrap().graph.id, base);
+        assert_ne!(compile(&COMPOSER.replace("literal: uppercase", "literal: lowercase")).unwrap().graph.id, base);
+
+        let cases = [
+            (
+                COMPOSER.replace("from: source\n                    path", "from: ghost\n                    path"),
+                "flow[2].compose.map.messages.list[1].map.content.select.from",
+            ),
+            (
+                COMPOSER.replace(
+                    "    compose:\n      literal:\n        text: meat",
+                    "    compose:\n      literal: 1\n      list: []",
+                ),
+                "flow[0].compose",
+            ),
+            (
+                COMPOSER.replace("literal: system", "quote: system"),
+                "flow[2].compose.map.messages.list[0].map.role.quote",
+            ),
+            (
+                COMPOSER.replace("path: [text]", "path: [-1]"),
+                "flow[2].compose.map.messages.list[1].map.content.select.path[0]",
+            ),
         ];
         for (src, at) in cases {
             assert_eq!(compile(&src).unwrap_err().at, at, "{src}");

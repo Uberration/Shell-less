@@ -48,6 +48,7 @@ The IR is the contract. The Rust interpreter in `runtime` is its first backend. 
 ```sh
 cargo run -p shell-less -- run --seed 42 examples/butcher.meat.yaml     # branching graph, two outputs
 cargo run -p shell-less -- run --seed 42 examples/failure.meat.yaml     # A staged → failure → B blocked → rollback
+cargo run -p shell-less -- run --seed 42 --show-outputs examples/composer.meat.yaml   # one source → tool + model
 cargo run -p shell-less -- run --seed 42 examples/thinker.meat.yaml    # /models/mock/infer → /state/answer
 cargo run -p shell-less -- run --seed 42 examples/model-failure.meat.yaml
 cargo run -p shell-less -- run --seed 42 examples/fork.meat.yaml        # model branch beside a tool branch
@@ -64,4 +65,8 @@ cargo run -p shell-less -- run examples/escalate-declared.meat.yaml     # reject
 - **Authority.** It is checked at compile time (declared `authority`), at load time (host `Policy`, all-or-nothing) and at every operation (the presented grant). A capability can never reach grants attached to another node.
 - **Determinism.** The same graph, seed and initial state give an identical receipt.
 - **Capability properties.** `Purity` (may it touch state?) and `Determinism` (same inputs, same output?) are independent. `InvocationMeta { implementation, revision }` records which implementation produced a result, and receipts record it for every invocation.
+- **Composition.** `compose` builds a value from `literal`, `select` (key/index path into an earlier output), `map` and `list`. Each expression has exactly one constructor. It holds no grants, reads no state, and has no interpolation or evaluation. Every selected source is a data edge. Missing keys, wrong kinds, out-of-range indexes and host limit breaches are structured failures.
+- **Content capture.** The host chooses `ContentCapture::Omit` (the default) or `Inline`. Receipts, journals, error details and CLI diagnostics carry no payloads under `Omit`. Real results go to the caller through `ExecutionOutcome.outputs` (CLI: `--show-outputs`). Programs and capabilities cannot raise capture.
+- **Atomicity boundary.** Only MeatFS state is transactional. Effects outside MeatFS are not undone. A completed invocation stays `Succeeded`, and its node's `staged` field reports whether its MeatFS changes were kept. Commit conflicts are reported, never retried. Invocations not declared pure are chained at load in a deterministic topological order (`derived_order` in the receipt), because their outside effects are invisible to footprints.
+- **Declared ≠ verified.** Purity, determinism and implementation identity are recorded as `declared`. Nothing yet verifies them, and they authorize no caching, retries or speculative parallelism. Compiled-in capabilities are trusted host code; grants bound their MeatFS access, not arbitrary Rust.
 - **Models are capabilities.** A model is mounted at a path like `/models/<name>/infer` and invoked like anything else. Inference is declared `Effectful`, even for the deterministic mock, because real inference depends on weights, samplers, hardware and caches.
