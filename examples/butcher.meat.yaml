@@ -1,0 +1,41 @@
+# Milestone 3 acceptance program: a branching graph with explicit outputs.
+agent:
+  name: butcher
+
+authority:
+  - path: /tools/text
+    rights: [invoke]
+  - path: /tools/echo
+    rights: [invoke]
+  - path: /state
+    rights: [write]
+
+flow:
+  - id: upper
+    invoke:
+      path: /tools/text/upper
+      input:
+        text: meat
+
+  - id: echo
+    invoke:
+      path: /tools/echo
+      input:
+        from: upper
+
+  - id: store_upper
+    write:
+      path: /state/upper
+      from: upper
+
+  - id: store_echo
+    write:
+      path: /state/echo
+      from: echo
+
+outputs:
+  upper:
+    from: store_upper
+
+  echo:
+    from: store_echo

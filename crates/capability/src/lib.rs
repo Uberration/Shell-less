@@ -11,7 +11,7 @@ use meatfs::{Access, Invoke, MeatFs, ObjectId, Path, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub use meatfs::{CallContext as CapabilityContext, CapabilityMeta, Purity};
+pub use meatfs::{CallContext as CapabilityContext, CapabilityMeta, Fault, Purity};
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -38,7 +38,7 @@ pub trait Capability: Send + Sync + 'static {
     /// Declared explicitly by every capability; there is no default.
     fn meta(&self) -> CapabilityMeta;
 
-    fn invoke(&self, ctx: &CapabilityContext<'_>, input: Self::Input) -> Result<Self::Output>;
+    fn invoke(&self, ctx: &CapabilityContext<'_>, input: Self::Input) -> Result<Self::Output, Fault>;
 }
 
 /// Adapts a typed [`Capability`] into an invocable MeatFS object.
@@ -49,8 +49,8 @@ impl<C: Capability> Invoke for Typed<C> {
         self.0.meta()
     }
 
-    fn invoke(&self, ctx: &CapabilityContext<'_>, input: Value) -> Result<Value> {
-        let input = C::Input::from_value(input).map_err(|e| format!("invalid input: {e}"))?;
+    fn invoke(&self, ctx: &CapabilityContext<'_>, input: Value) -> Result<Value, Fault> {
+        let input = C::Input::from_value(input).map_err(Fault::InvalidInput)?;
         self.0.invoke(ctx, input).map(IntoValue::into_value)
     }
 
@@ -174,7 +174,7 @@ mod tests {
             Value::map([("text", Value::Int(1))]),
             Value::map([("text", Value::from("a")), ("extra", Value::Null)]),
         ] {
-            assert!(fs.invoke(&root, echo, bad).is_err());
+            assert!(matches!(fs.invoke(&root, echo, bad), Err(meatfs::Error::InvalidInput { .. })));
         }
     }
 }

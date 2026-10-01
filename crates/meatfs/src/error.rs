@@ -16,21 +16,28 @@ pub enum Error {
         object: ObjectId,
         op: &'static str,
     },
-    /// A data object that has never been written.
-    Empty(ObjectId),
     /// The presented grant does not cover the operation.
     Denied {
         object: ObjectId,
         needed: Rights,
     },
-    /// The grant was not issued by this namespace, or has been retired.
+    /// The grant was not issued by this authority domain, or was retired.
     InvalidGrant(GrantId),
     /// Host policy forbids requesting this authority.
     PolicyDenied {
         path: Path,
         rights: Rights,
     },
-    /// A capability rejected its input or failed while executing.
+    /// A capability asked for authority not attached to its node.
+    NotAttached(Path),
+    /// A capability declared pure attempted an effect.
+    Impure(ObjectId),
+    /// A capability rejected its input.
+    InvalidInput {
+        object: ObjectId,
+        message: String,
+    },
+    /// A capability failed while executing.
     Capability {
         object: ObjectId,
         message: String,
@@ -47,10 +54,12 @@ impl fmt::Display for Error {
             Error::AlreadyBound(p) => write!(f, "{p}: name conflicts with an existing binding"),
             Error::UnknownObject(o) => write!(f, "{o}: no such object"),
             Error::Unsupported { object, op } => write!(f, "{object}: does not support `{op}`"),
-            Error::Empty(o) => write!(f, "{o}: never written"),
             Error::Denied { object, needed } => write!(f, "{object}: denied, requires {needed}"),
-            Error::InvalidGrant(g) => write!(f, "{g}: not a live grant of this namespace"),
+            Error::InvalidGrant(g) => write!(f, "{g}: not a live grant of this authority domain"),
             Error::PolicyDenied { path, rights } => write!(f, "{path}: policy forbids requesting {rights}"),
+            Error::NotAttached(p) => write!(f, "{p}: no authority attached to this node"),
+            Error::Impure(o) => write!(f, "{o}: pure capability attempted an effect"),
+            Error::InvalidInput { object, message } => write!(f, "{object}: invalid input: {message}"),
             Error::Capability { object, message } => write!(f, "{object}: {message}"),
             Error::Conflict(o) => write!(f, "{o}: changed during transaction"),
         }

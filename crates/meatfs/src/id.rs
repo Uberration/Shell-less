@@ -54,6 +54,28 @@ id!(
     "exe"
 );
 
+/// The live trust domain that issued a grant: one per namespace instance.
+///
+/// Deliberately *not* derived from the [`Seed`]: identically seeded
+/// namespaces reproduce object, principal and execution identities, but
+/// never accept each other's grants. Never part of a receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AuthorityDomainId(u64);
+
+impl AuthorityDomainId {
+    pub(crate) fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        AuthorityDomainId(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl fmt::Display for AuthorityDomainId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dom:{:016x}", self.0)
+    }
+}
+
 /// A node within an execution graph. Assigned by the compiler, stable for a
 /// given graph, and carried by events for provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

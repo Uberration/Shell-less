@@ -1,4 +1,4 @@
-# Milestone 2 acceptance program.
+# Milestone 2 acceptance program, with an explicit output.
 agent:
   name: echoer
 
@@ -20,3 +20,7 @@ flow:
     write:
       path: /state/result
       from: make_meat
+
+outputs:
+  result:
+    from: store

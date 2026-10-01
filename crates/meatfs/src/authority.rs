@@ -5,20 +5,24 @@
 //! * [`Policy`] — path-prefix rules describing what *may be requested*. Plain
 //!   data, freely constructed by the host.
 //! * [`Grant`] — an authority instance *actually issued* by a namespace. It
-//!   cannot be constructed, cloned or mutated outside this crate, and the
-//!   issuing namespace keeps a registry of live grants, so a grant is only
-//!   honoured by the namespace that issued it and only until retired.
+//!   cannot be constructed, cloned or mutated outside this crate. The issuing
+//!   namespace — its [`AuthorityDomainId`] — keeps a registry of live grants,
+//!   so a grant is honoured only by the live domain that issued it, and only
+//!   until retired.
 //!
 //! Knowing a pathname confers nothing: every operation presents an [`Access`]
-//! naming one grant from the holder's [`GrantSet`].
+//! naming one grant from the holder's [`GrantSet`]. Invoked capabilities see
+//! only a [`NodeGrants`] projection — the grants attached to their node.
 
-use crate::{ExecutionId, GrantId, NodeId, ObjectId, Path, PrincipalId, Rights};
+use crate::{AuthorityDomainId, ExecutionId, GrantId, NodeId, ObjectId, Path, PrincipalId, Rights};
 
 /// What a grant points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// One object, by identity, wherever it is bound.
+    /// One existing object, by identity, wherever it is bound.
     Object(ObjectId),
+    /// One currently unbound name: the right to bind a new data object there.
+    Name(Path),
     /// Every object bound beneath a prefix, plus the right to bind new names
     /// there. Issued only to the host at genesis.
     Namespace(Path),
@@ -66,15 +70,20 @@ impl Grant {
     }
 }
 
-/// Every grant issued to one principal by one request.
+/// Every grant issued to one principal by one request, index-aligned with
+/// the request's `wants`.
 #[derive(Debug)]
 pub struct GrantSet {
-    pub(crate) issuer: u128,
+    pub(crate) domain: AuthorityDomainId,
     pub(crate) principal: PrincipalId,
     pub(crate) grants: Vec<Grant>,
 }
 
 impl GrantSet {
+    pub fn domain(&self) -> AuthorityDomainId {
+        self.domain
+    }
+
     pub fn principal(&self) -> PrincipalId {
         self.principal
     }
@@ -83,18 +92,48 @@ impl GrantSet {
         self.grants.iter()
     }
 
-    pub fn get(&self, id: GrantId) -> Option<&Grant> {
-        self.grants.iter().find(|g| g.id == id)
+    /// The grant issued for the request's `index`-th want.
+    pub fn issued(&self, index: usize) -> Option<&Grant> {
+        self.grants.get(index)
     }
 
-    /// The grant issued for a specific object.
-    pub fn for_object(&self, object: ObjectId) -> Option<&Grant> {
-        self.grants.iter().find(|g| g.target == Target::Object(object))
+    pub fn get(&self, id: GrantId) -> Option<&Grant> {
+        self.grants.iter().find(|g| g.id == id)
     }
 
     /// Present one grant from this set for an operation.
     pub fn access(&self, id: GrantId) -> Option<Access<'_>> {
         Some(Access { grants: self, grant: self.get(id)?, cause: None })
+    }
+}
+
+/// A grant attached to a node under the name the node requested it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeGrant {
+    pub path: Path,
+    pub grant: GrantId,
+}
+
+/// The authority attached to one node: a projection of a [`GrantSet`].
+///
+/// Construction only ever narrows — every entry must name a grant in the set.
+#[derive(Clone, Copy)]
+pub struct NodeGrants<'a> {
+    pub(crate) set: &'a GrantSet,
+    pub(crate) entries: &'a [NodeGrant],
+}
+
+impl<'a> NodeGrants<'a> {
+    pub fn new(set: &'a GrantSet, entries: &'a [NodeGrant]) -> Option<Self> {
+        entries.iter().all(|e| set.get(e.grant).is_some()).then_some(NodeGrants { set, entries })
+    }
+
+    pub fn empty(set: &'a GrantSet) -> Self {
+        NodeGrants { set, entries: &[] }
+    }
+
+    pub fn entries(&self) -> &'a [NodeGrant] {
+        self.entries
     }
 }
 
@@ -123,6 +162,10 @@ impl<'a> Access<'a> {
         self.grant
     }
 
+    pub fn grants(&self) -> &'a GrantSet {
+        self.grants
+    }
+
     pub fn cause(&self) -> Option<Cause> {
         self.cause
     }
@@ -149,11 +192,11 @@ impl Policy {
     }
 }
 
-/// The concrete authority a principal asks to be issued.
+/// The concrete authority a principal asks to be issued: one entry per use,
+/// so each use receives its own grant with exactly the rights it needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthorityRequest {
     pub principal: String,
-    /// Exact names and the rights wanted on each, merged per path.
     pub wants: Vec<(Path, Rights)>,
 }
 
@@ -163,10 +206,7 @@ impl AuthorityRequest {
     }
 
     pub fn want(mut self, path: Path, rights: Rights) -> Self {
-        match self.wants.iter_mut().find(|(p, _)| *p == path) {
-            Some((_, r)) => *r = *r | rights,
-            None => self.wants.push((path, rights)),
-        }
+        self.wants.push((path, rights));
         self
     }
 }

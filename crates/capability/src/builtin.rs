@@ -1,6 +1,6 @@
 //! The first native capabilities. Pure, deterministic, no I/O.
 
-use crate::{Capability, CapabilityContext, CapabilityMeta, Fields, FromValue, IntoValue, Purity, Result};
+use crate::{Capability, CapabilityContext, CapabilityMeta, Fault, Fields, FromValue, IntoValue, Purity, Result};
 use meatfs::Value;
 
 const PURE: CapabilityMeta = CapabilityMeta { purity: Purity::Pure };
@@ -53,7 +53,7 @@ impl Capability for Echo {
         PURE
     }
 
-    fn invoke(&self, _: &CapabilityContext<'_>, input: Text) -> Result<Text> {
+    fn invoke(&self, _: &CapabilityContext<'_>, input: Text) -> Result<Text, Fault> {
         Ok(input)
     }
 }
@@ -73,7 +73,28 @@ impl Capability for Upper {
         PURE
     }
 
-    fn invoke(&self, _: &CapabilityContext<'_>, input: Text) -> Result<Text> {
+    fn invoke(&self, _: &CapabilityContext<'_>, input: Text) -> Result<Text, Fault> {
         Ok(Text { text: input.text.to_uppercase() })
+    }
+}
+
+/// Test fixture: always fails, deterministically. Exists so failure,
+/// blocking and rollback semantics can be exercised end to end.
+pub struct Fail;
+
+impl Capability for Fail {
+    type Input = Value;
+    type Output = Value;
+
+    fn describe(&self) -> &'static str {
+        "always fail (test fixture)"
+    }
+
+    fn meta(&self) -> CapabilityMeta {
+        PURE
+    }
+
+    fn invoke(&self, _: &CapabilityContext<'_>, _: Value) -> Result<Value, Fault> {
+        Err(Fault::Failed("deliberate failure".to_owned()))
     }
 }

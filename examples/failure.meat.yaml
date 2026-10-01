@@ -1,0 +1,25 @@
+# Milestone 3 failure acceptance: write A → failure → write B, atomically.
+agent:
+  name: doomed
+
+authority:
+  - path: /state
+    rights: [write]
+  - path: /tools/test/fail
+    rights: [invoke]
+
+flow:
+  - id: write_a
+    write:
+      path: /state/a
+      value: { text: A }
+
+  - id: failure
+    invoke:
+      path: /tools/test/fail
+      from: write_a
+
+  - id: write_b
+    write:
+      path: /state/b
+      from: failure

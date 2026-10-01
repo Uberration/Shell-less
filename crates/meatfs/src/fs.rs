@@ -1,9 +1,9 @@
-use crate::authority::{Access, AuthorityRequest, Cause, Grant, GrantSet, Policy, Target};
+use crate::authority::{Access, AuthorityRequest, Cause, Grant, GrantSet, NodeGrant, NodeGrants, Policy, Target};
 use crate::id::IdGen;
-use crate::{Error, ExecutionId, GrantId, ObjectId, Path, PrincipalId, Result, Rights, Seed, Value};
+use crate::{AuthorityDomainId, Error, ExecutionId, GrantId, ObjectId, Path, PrincipalId, Result, Rights, Seed, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -13,7 +13,7 @@ pub enum Purity {
     /// `input → output` only: no MeatFS access, no clocks, no randomness, no
     /// external state. Safe to cache, replay, parallelize and compile.
     Pure,
-    /// May act on MeatFS through the caller's grants.
+    /// May act on MeatFS through the grants attached to its node.
     Effectful,
 }
 
@@ -22,10 +22,22 @@ pub struct CapabilityMeta {
     pub purity: Purity,
 }
 
+/// Why an invocation did not produce an output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fault {
+    InvalidInput(String),
+    Failed(String),
+    /// A substrate operation performed by the capability failed.
+    Substrate(Error),
+}
+
+impl From<Error> for Fault {
+    fn from(e: Error) -> Self {
+        Fault::Substrate(e)
+    }
+}
+
 /// An invocable object: the raw, untyped form of a capability.
-///
-/// The namespace never holds its lock while invoking, so an effectful
-/// implementation may call back into MeatFS through [`CallContext::effects`].
 pub trait Invoke: Send + Sync {
     fn meta(&self) -> CapabilityMeta;
 
@@ -34,7 +46,7 @@ pub trait Invoke: Send + Sync {
         Value::Null
     }
 
-    fn invoke(&self, cx: &CallContext<'_>, input: Value) -> std::result::Result<Value, String>;
+    fn invoke(&self, cx: &CallContext<'_>, input: Value) -> std::result::Result<Value, Fault>;
 }
 
 /// What an invoked object is given. A pure capability receives no effects
@@ -45,34 +57,54 @@ pub struct CallContext<'a> {
 }
 
 impl<'a> CallContext<'a> {
-    pub fn effects(&self) -> std::result::Result<&Effects<'a>, String> {
-        self.effects.as_ref().ok_or_else(|| "pure capability attempted an effect".to_owned())
+    pub fn effects(&self) -> std::result::Result<&Effects<'a>, Fault> {
+        self.effects.as_ref().ok_or(Fault::Substrate(Error::Impure(self.object)))
     }
 }
 
-/// The caller's namespace and grants, lent to an effectful capability.
+/// MeatFS as seen by an effectful capability: only the grants attached to
+/// its node, inside its execution's transaction.
 pub struct Effects<'a> {
-    pub fs: &'a MeatFs,
-    pub grants: &'a GrantSet,
-    pub cause: Option<Cause>,
+    tx: &'a Transaction<'a>,
+    grants: NodeGrants<'a>,
+    cause: Option<Cause>,
 }
 
 impl Effects<'_> {
-    pub fn access(&self, id: GrantId) -> Option<Access<'_>> {
-        let access = self.grants.access(id)?;
-        Some(match self.cause {
+    /// The authority attached to this invocation.
+    pub fn grants(&self) -> &[NodeGrant] {
+        self.grants.entries
+    }
+
+    fn access(&self, path: &Path) -> Result<Access<'_>> {
+        let entry = self.grants.entries.iter().find(|e| e.path == *path).ok_or(Error::NotAttached(path.clone()))?;
+        let access = self.grants.set.access(entry.grant).expect("NodeGrants only names grants in its set");
+        Ok(match self.cause {
             Some(cause) => access.caused_by(cause),
             None => access,
         })
     }
+
+    pub fn read(&self, path: &Path) -> Result<Value> {
+        let access = self.access(path)?;
+        match access.grant.target() {
+            Target::Object(object) => self.tx.read(&access, *object),
+            _ => Err(Error::Unbound(path.clone())),
+        }
+    }
+
+    /// Create-or-replace, as the attached grant allows.
+    pub fn write(&self, path: &Path, value: Value) -> Result<ObjectId> {
+        let access = self.access(path)?;
+        match access.grant.target() {
+            Target::Object(object) => self.tx.write(&access, *object, value).map(|_| *object),
+            _ => self.tx.create(&access, path, value),
+        }
+    }
 }
 
 enum Body {
-    /// `value` is `None` until first written (version 0).
-    Data {
-        value: Option<Value>,
-        version: u64,
-    },
+    Data { value: Value, version: u64 },
     Capability(Arc<dyn Invoke>),
 }
 
@@ -91,13 +123,15 @@ pub enum NodeKind {
 pub struct Inspection {
     pub object: ObjectId,
     pub kind: NodeKind,
-    /// Data version; 0 for capabilities and unwritten data.
+    /// Data version; 0 for capabilities.
     pub version: u64,
     pub names: Vec<Path>,
     pub meta: Option<CapabilityMeta>,
     pub signature: Value,
 }
 
+/// One entry of the audit journal. The journal records attempts and their
+/// outcomes; it is never rolled back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub seq: u64,
@@ -112,9 +146,20 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventKind {
     Bound(Path),
-    Read { version: u64 },
-    Written { version: u64 },
-    Invoked { ok: bool },
+    Read {
+        version: u64,
+    },
+    /// A write or creation staged in a transaction, not yet visible.
+    Staged,
+    /// A change became visible state.
+    Written {
+        version: u64,
+    },
+    /// A staged change was discarded.
+    RolledBack,
+    Invoked {
+        ok: bool,
+    },
 }
 
 /// A live stream of events within a grant's target.
@@ -135,6 +180,7 @@ impl Subscription {
 fn covers(target: &Target, object: ObjectId, names: &BTreeSet<Path>) -> bool {
     match target {
         Target::Object(id) => *id == object,
+        Target::Name(_) => false,
         Target::Namespace(prefix) => names.iter().any(|n| n.starts_with(prefix)),
     }
 }
@@ -179,21 +225,27 @@ struct State {
     objects: BTreeMap<ObjectId, Object>,
     names: BTreeMap<Path, ObjectId>,
     principals: BTreeMap<String, PrincipalId>,
-    /// Grants issued by this namespace and not yet retired.
+    /// Grants issued by this domain and not yet retired.
     live: BTreeSet<GrantId>,
 }
 
 impl State {
-    fn verify_grant(&self, issuer: u128, access: &Access<'_>) -> Result<()> {
-        if access.grants.issuer == issuer && self.live.contains(&access.grant.id()) {
+    fn verify_grant(&self, domain: AuthorityDomainId, access: &Access<'_>) -> Result<()> {
+        if access.grants.domain == domain && self.live.contains(&access.grant.id()) {
             Ok(())
         } else {
             Err(Error::InvalidGrant(access.grant.id()))
         }
     }
 
-    fn verify(&self, issuer: u128, access: &Access<'_>, object: ObjectId, needed: Rights) -> Result<&Object> {
-        self.verify_grant(issuer, access)?;
+    fn verify(
+        &self,
+        domain: AuthorityDomainId,
+        access: &Access<'_>,
+        object: ObjectId,
+        needed: Rights,
+    ) -> Result<&Object> {
+        self.verify_grant(domain, access)?;
         let obj = self.objects.get(&object).ok_or(Error::UnknownObject(object))?;
         if covers(access.grant.target(), object, &obj.names) && access.grant.rights().contains(needed) {
             Ok(obj)
@@ -202,30 +254,47 @@ impl State {
         }
     }
 
-    /// Authority over names (binding, walking), which only a namespace grant carries.
-    fn verify_namespace(&self, issuer: u128, access: &Access<'_>, path: &Path, needed: Rights) -> Result<()> {
-        self.verify_grant(issuer, access)?;
+    /// Authority to bind `path`: a namespace grant over it, or a name grant
+    /// for exactly it.
+    fn verify_bind(&self, domain: AuthorityDomainId, access: &Access<'_>, path: &Path) -> Result<()> {
+        self.verify_grant(domain, access)?;
+        let ok = access.grant.rights().contains(Rights::WRITE)
+            && match access.grant.target() {
+                Target::Namespace(prefix) => path.starts_with(prefix),
+                Target::Name(name) => name == path,
+                Target::Object(_) => false,
+            };
+        ok.then_some(()).ok_or(Error::PolicyDenied { path: path.clone(), rights: Rights::WRITE })
+    }
+
+    fn verify_namespace(
+        &self,
+        domain: AuthorityDomainId,
+        access: &Access<'_>,
+        path: &Path,
+        needed: Rights,
+    ) -> Result<()> {
+        self.verify_grant(domain, access)?;
         match access.grant.target() {
             Target::Namespace(prefix) if path.starts_with(prefix) && access.grant.rights().contains(needed) => Ok(()),
             _ => Err(Error::PolicyDenied { path: path.clone(), rights: needed }),
         }
     }
 
-    fn bind(&mut self, path: &Path, body: Body) -> ObjectId {
-        let id = self.ids.object();
+    fn insert(&mut self, id: ObjectId, path: &Path, body: Body) {
         self.objects.insert(id, Object { body, names: BTreeSet::from([path.clone()]) });
         self.names.insert(path.clone(), id);
-        id
     }
 }
 
 /// The in-memory MeatFS namespace.
 pub struct MeatFs {
-    /// Identity of this namespace as a grant issuer.
-    issuer: u128,
+    domain: AuthorityDomainId,
     state: RwLock<State>,
     journal: Mutex<Journal>,
 }
+
+const NO_NAMES: &BTreeSet<Path> = &BTreeSet::new();
 
 impl MeatFs {
     /// Create a namespace and the one root grant set that governs it.
@@ -233,11 +302,7 @@ impl MeatFs {
     /// There is no other way to obtain namespace authority: the host holds
     /// this set and issues narrower grants from it via [`MeatFs::issue`].
     pub fn genesis(seed: Seed) -> (MeatFs, GrantSet) {
-        // The issuer token is unique per namespace instance, independent of the
-        // seed, so two identically seeded namespaces never honour each
-        // other's grants. It never appears in events or receipts.
-        static NEXT_ISSUER: AtomicU64 = AtomicU64::new(1);
-        let issuer = u128::from(NEXT_ISSUER.fetch_add(1, Ordering::Relaxed));
+        let domain = AuthorityDomainId::fresh();
         let mut ids = IdGen::new(seed);
         let host = ids.principal();
         let root = Grant::new(ids.grant(), host, Target::Namespace(Path::root()), Rights::ALL);
@@ -248,8 +313,12 @@ impl MeatFs {
             principals: BTreeMap::from([("host".to_owned(), host)]),
             live: BTreeSet::from([root.id()]),
         };
-        let fs = MeatFs { issuer, state: RwLock::new(state), journal: Mutex::default() };
-        (fs, GrantSet { issuer, principal: host, grants: vec![root] })
+        let fs = MeatFs { domain, state: RwLock::new(state), journal: Mutex::default() };
+        (fs, GrantSet { domain, principal: host, grants: vec![root] })
+    }
+
+    pub fn domain(&self) -> AuthorityDomainId {
+        self.domain
     }
 
     fn record(&self, names: &BTreeSet<Path>, object: ObjectId, who: Who, kind: EventKind) {
@@ -263,28 +332,31 @@ impl MeatFs {
 
     /// Resolve an authority request against host policy into grants.
     ///
-    /// All-or-nothing: every wanted path must be permitted by `policy` and
-    /// either bound or — when write is wanted — bindable, in which case an
-    /// empty data object is provisioned. Grants are issued per object, so a
-    /// principal receives authority over exactly what it will touch.
+    /// Observational and all-or-nothing: nothing in the namespace changes.
+    /// Each want receives its own grant, index-aligned with the request. A
+    /// bound name yields an object grant; an unbound one, when write is
+    /// wanted and the name is bindable, yields a name grant.
     pub fn issue(&self, policy: &Policy, request: &AuthorityRequest) -> Result<GrantSet> {
         let mut st = self.state.write().unwrap();
 
-        // Validate everything before changing anything.
-        let mut planned: BTreeMap<Path, ()> = st.names.keys().map(|n| (n.clone(), ())).collect();
-        let mut provision = Vec::new();
+        let mut targets = Vec::with_capacity(request.wants.len());
+        let mut new_names: BTreeMap<Path, ()> = BTreeMap::new();
         for (path, rights) in &request.wants {
             if !policy.permits(path, *rights) {
                 return Err(Error::PolicyDenied { path: path.clone(), rights: *rights });
             }
-            if !planned.contains_key(path) {
-                if !rights.contains(Rights::WRITE) {
-                    return Err(Error::Unbound(path.clone()));
+            targets.push(match st.names.get(path) {
+                Some(&object) => Target::Object(object),
+                None if rights.contains(Rights::WRITE) => {
+                    if !new_names.contains_key(path) {
+                        bindable(&st.names, path)?;
+                        bindable(&new_names, path)?;
+                        new_names.insert(path.clone(), ());
+                    }
+                    Target::Name(path.clone())
                 }
-                bindable(&planned, path)?;
-                planned.insert(path.clone(), ());
-                provision.push(path);
-            }
+                None => return Err(Error::Unbound(path.clone())),
+            });
         }
 
         let principal = match st.principals.get(&request.principal) {
@@ -295,31 +367,16 @@ impl MeatFs {
                 id
             }
         };
-        for path in provision {
-            let object = st.bind(path, Body::Data { value: None, version: 0 });
-            let who = Who { principal, grant: None, cause: None };
-            self.record(&st.objects[&object].names, object, who, EventKind::Bound(path.clone()));
-        }
-
-        let mut rights_of: BTreeMap<ObjectId, Rights> = BTreeMap::new();
-        let mut order = Vec::new();
-        for (path, rights) in &request.wants {
-            let object = st.names[path];
-            let held = rights_of.entry(object).or_insert_with(|| {
-                order.push(object);
-                Rights::NONE
-            });
-            *held = *held | *rights;
-        }
-        let grants = order
+        let grants = targets
             .into_iter()
-            .map(|object| {
-                let grant = Grant::new(st.ids.grant(), principal, Target::Object(object), rights_of[&object]);
+            .zip(&request.wants)
+            .map(|(target, (_, rights))| {
+                let grant = Grant::new(st.ids.grant(), principal, target, *rights);
                 st.live.insert(grant.id());
                 grant
             })
             .collect();
-        Ok(GrantSet { issuer: self.issuer, principal, grants })
+        Ok(GrantSet { domain: self.domain, principal, grants })
     }
 
     /// Revoke every grant in the set.
@@ -339,74 +396,71 @@ impl MeatFs {
         self.state.read().unwrap().names.get(path).copied()
     }
 
+    /// A capability's declared metadata. Public contract, not authority.
+    pub fn meta(&self, object: ObjectId) -> Option<CapabilityMeta> {
+        match &self.state.read().unwrap().objects.get(&object)?.body {
+            Body::Capability(c) => Some(c.meta()),
+            Body::Data { .. } => None,
+        }
+    }
+
     fn bind_body(&self, access: &Access<'_>, path: &Path, body: Body) -> Result<ObjectId> {
         let mut st = self.state.write().unwrap();
-        st.verify_namespace(self.issuer, access, path, Rights::WRITE)?;
+        st.verify_bind(self.domain, access, path)?;
         bindable(&st.names, path)?;
-        let object = st.bind(path, body);
+        let object = st.ids.object();
+        st.insert(object, path, body);
         self.record(&st.objects[&object].names, object, Who::of(access), EventKind::Bound(path.clone()));
         Ok(object)
     }
 
-    /// Bind a new data object at `path`.
+    /// Bind a new data object at `path`, immediately.
     pub fn bind(&self, access: &Access<'_>, path: &Path, value: Value) -> Result<ObjectId> {
-        let object = self.bind_body(access, path, Body::Data { value: None, version: 0 })?;
-        self.write(access, object, value)?;
-        Ok(object)
+        self.bind_body(access, path, Body::Data { value, version: 1 })
     }
 
-    /// Bind a new capability object at `path`.
+    /// Bind a new capability object at `path`, immediately.
     pub fn mount(&self, access: &Access<'_>, path: &Path, capability: Arc<dyn Invoke>) -> Result<ObjectId> {
         self.bind_body(access, path, Body::Capability(capability))
     }
 
     pub fn read(&self, access: &Access<'_>, object: ObjectId) -> Result<Value> {
         let st = self.state.read().unwrap();
-        let obj = st.verify(self.issuer, access, object, Rights::READ)?;
-        let (value, version) = match &obj.body {
-            Body::Data { value: Some(value), version } => (value.clone(), *version),
-            Body::Data { value: None, .. } => return Err(Error::Empty(object)),
-            Body::Capability(_) => return Err(Error::Unsupported { object, op: "read" }),
+        let obj = st.verify(self.domain, access, object, Rights::READ)?;
+        let Body::Data { value, version } = &obj.body else {
+            return Err(Error::Unsupported { object, op: "read" });
         };
-        self.record(&obj.names, object, Who::of(access), EventKind::Read { version });
-        Ok(value)
+        self.record(&obj.names, object, Who::of(access), EventKind::Read { version: *version });
+        Ok(value.clone())
     }
 
+    /// Replace a data object's value, immediately.
     pub fn write(&self, access: &Access<'_>, object: ObjectId, value: Value) -> Result<u64> {
-        let mut st = self.state.write().unwrap();
-        st.verify(self.issuer, access, object, Rights::WRITE)?;
-        let obj = st.objects.get_mut(&object).expect("verified");
-        let Body::Data { value: slot, version } = &mut obj.body else {
-            return Err(Error::Unsupported { object, op: "write" });
-        };
-        *slot = Some(value);
-        *version += 1;
-        let version = *version;
-        self.record(&obj.names, object, Who::of(access), EventKind::Written { version });
-        Ok(version)
+        let tx = self.transaction();
+        tx.write(access, object, value)?;
+        tx.commit()?;
+        let st = self.state.read().unwrap();
+        match st.objects[&object].body {
+            Body::Data { version, .. } => Ok(version),
+            Body::Capability(_) => unreachable!("write verified a data object"),
+        }
     }
 
+    /// Invoke outside any graph: the capability receives no attached grants.
     pub fn invoke(&self, access: &Access<'_>, object: ObjectId, input: Value) -> Result<Value> {
-        let capability = {
-            let st = self.state.read().unwrap();
-            match &st.verify(self.issuer, access, object, Rights::INVOKE)?.body {
-                Body::Capability(c) => Arc::clone(c),
-                Body::Data { .. } => return Err(Error::Unsupported { object, op: "invoke" }),
+        let tx = self.transaction();
+        match tx.invoke(access, object, input, NodeGrants::empty(access.grants)) {
+            Ok(output) => tx.commit().map(|_| output),
+            Err(e) => {
+                tx.rollback();
+                Err(e)
             }
-        };
-        let effects = match capability.meta().purity {
-            Purity::Pure => None,
-            Purity::Effectful => Some(Effects { fs: self, grants: access.grants, cause: access.cause }),
-        };
-        let result = capability.invoke(&CallContext { object, effects }, input);
-        let st = self.state.read().unwrap();
-        self.record(&st.objects[&object].names, object, Who::of(access), EventKind::Invoked { ok: result.is_ok() });
-        result.map_err(|message| Error::Capability { object, message })
+        }
     }
 
     pub fn inspect(&self, access: &Access<'_>, object: ObjectId) -> Result<Inspection> {
         let st = self.state.read().unwrap();
-        let obj = st.verify(self.issuer, access, object, Rights::INSPECT)?;
+        let obj = st.verify(self.domain, access, object, Rights::INSPECT)?;
         let names = obj.names.iter().cloned().collect();
         Ok(match &obj.body {
             Body::Data { version, .. } => Inspection {
@@ -430,12 +484,12 @@ impl MeatFs {
 
     /// Receive every future event within the presented grant's target.
     pub fn subscribe(&self, access: &Access<'_>) -> Result<Subscription> {
-        self.state.read().unwrap().verify_grant(self.issuer, access)?;
+        self.state.read().unwrap().verify_grant(self.domain, access)?;
         let target = access.grant.target().clone();
         if !access.grant.rights().contains(Rights::SUBSCRIBE) {
             return Err(match target {
                 Target::Object(object) => Error::Denied { object, needed: Rights::SUBSCRIBE },
-                Target::Namespace(path) => Error::PolicyDenied { path, rights: Rights::SUBSCRIBE },
+                Target::Name(path) | Target::Namespace(path) => Error::PolicyDenied { path, rights: Rights::SUBSCRIBE },
             });
         }
         let (tx, rx) = mpsc::channel();
@@ -446,7 +500,7 @@ impl MeatFs {
     /// Every bound name beneath `prefix`, in order.
     pub fn walk(&self, access: &Access<'_>, prefix: &Path) -> Result<Vec<(Path, ObjectId, NodeKind)>> {
         let st = self.state.read().unwrap();
-        st.verify_namespace(self.issuer, access, prefix, Rights::INSPECT)?;
+        st.verify_namespace(self.domain, access, prefix, Rights::INSPECT)?;
         Ok(st
             .names
             .range(prefix..)
@@ -461,19 +515,43 @@ impl MeatFs {
             .collect())
     }
 
+    /// Every bound name and data value beneath `prefix`: a comparable view of
+    /// namespace state.
+    pub fn snapshot(&self, access: &Access<'_>, prefix: &Path) -> Result<Vec<(Path, ObjectId, Option<Value>)>> {
+        let st = self.state.read().unwrap();
+        st.verify_namespace(self.domain, access, prefix, Rights::INSPECT | Rights::READ)?;
+        Ok(st
+            .names
+            .range(prefix..)
+            .take_while(|(name, _)| name.starts_with(prefix))
+            .map(|(name, &id)| {
+                let value = match &st.objects[&id].body {
+                    Body::Data { value, .. } => Some(value.clone()),
+                    Body::Capability(_) => None,
+                };
+                (name.clone(), id, value)
+            })
+            .collect())
+    }
+
     /// The audit journal for every object bound beneath `prefix`.
     pub fn journal(&self, access: &Access<'_>, prefix: &Path) -> Result<Vec<Event>> {
         let st = self.state.read().unwrap();
-        st.verify_namespace(self.issuer, access, prefix, Rights::INSPECT)?;
+        st.verify_namespace(self.domain, access, prefix, Rights::INSPECT)?;
         let target = Target::Namespace(prefix.clone());
         let journal = self.journal.lock().unwrap();
-        Ok(journal.events.iter().filter(|e| covers(&target, e.object, &st.objects[&e.object].names)).cloned().collect())
+        Ok(journal
+            .events
+            .iter()
+            .filter(|e| covers(&target, e.object, st.objects.get(&e.object).map_or(NO_NAMES, |o| &o.names)))
+            .cloned()
+            .collect())
     }
 
     /// Every event caused by the presented access's execution. A principal
     /// may always see what its own execution did.
     pub fn execution_events(&self, access: &Access<'_>) -> Result<Vec<Event>> {
-        self.state.read().unwrap().verify_grant(self.issuer, access)?;
+        self.state.read().unwrap().verify_grant(self.domain, access)?;
         let Some(cause) = access.cause else {
             return Ok(Vec::new());
         };
@@ -482,69 +560,199 @@ impl MeatFs {
     }
 
     pub fn transaction(&self) -> Transaction<'_> {
-        Transaction { fs: self, reads: Vec::new(), writes: Vec::new() }
+        Transaction { fs: self, staging: RefCell::default() }
     }
 }
 
-/// Optimistic, all-or-nothing batch of writes.
+#[derive(Default)]
+struct Staging {
+    /// Committed version observed by each read.
+    reads: BTreeMap<ObjectId, u64>,
+    /// Committed version each existing object had when first staged.
+    bases: BTreeMap<ObjectId, u64>,
+    values: BTreeMap<ObjectId, Value>,
+    /// Objects to be bound at commit, with their names.
+    creates: BTreeMap<ObjectId, Path>,
+    /// Staged objects in first-touch order, with who touched them last.
+    order: Vec<ObjectId>,
+    who: BTreeMap<ObjectId, Who>,
+}
+
+impl Staging {
+    fn stage(&mut self, object: ObjectId, value: Value, who: Who) {
+        if self.values.insert(object, value).is_none() {
+            self.order.push(object);
+        }
+        self.who.insert(object, who);
+    }
+
+    fn created_at(&self, path: &Path) -> Option<ObjectId> {
+        self.creates.iter().find(|(_, p)| *p == path).map(|(o, _)| *o)
+    }
+}
+
+/// An optimistic, all-or-nothing unit of change.
 ///
-/// Reads record the version seen; `commit` fails with [`Error::Conflict`] if
-/// any of them changed, or [`Error::InvalidGrant`] if a staged grant was
-/// retired meanwhile, and otherwise applies every staged write atomically.
+/// Reads see the transaction's own staged writes. `commit` fails with
+/// [`Error::Conflict`] if anything read or written changed underneath it,
+/// or [`Error::InvalidGrant`] if a staged grant was retired, and otherwise
+/// applies every staged change atomically. Staging and outcomes are always
+/// journaled; only state is transactional.
 pub struct Transaction<'a> {
     fs: &'a MeatFs,
-    reads: Vec<(ObjectId, u64)>,
-    writes: Vec<(ObjectId, Value, Who)>,
+    staging: RefCell<Staging>,
 }
 
 impl Transaction<'_> {
-    pub fn read(&mut self, access: &Access<'_>, object: ObjectId) -> Result<Value> {
-        if let Some((_, value, _)) = self.writes.iter().rev().find(|(o, _, _)| *o == object) {
-            return Ok(value.clone());
-        }
+    pub fn read(&self, access: &Access<'_>, object: ObjectId) -> Result<Value> {
         let st = self.fs.state.read().unwrap();
-        match &st.verify(self.fs.issuer, access, object, Rights::READ)?.body {
-            Body::Data { value: Some(value), version } => {
-                self.reads.push((object, *version));
-                Ok(value.clone())
+        let obj = st.verify(self.fs.domain, access, object, Rights::READ)?;
+        let Body::Data { value, version } = &obj.body else {
+            return Err(Error::Unsupported { object, op: "read" });
+        };
+        let mut staging = self.staging.borrow_mut();
+        let value = match staging.values.get(&object) {
+            Some(staged) => staged.clone(),
+            None => {
+                staging.reads.entry(object).or_insert(*version);
+                value.clone()
             }
-            Body::Data { value: None, .. } => Err(Error::Empty(object)),
-            Body::Capability(_) => Err(Error::Unsupported { object, op: "read" }),
-        }
+        };
+        self.fs.record(&obj.names, object, Who::of(access), EventKind::Read { version: *version });
+        Ok(value)
     }
 
-    pub fn write(&mut self, access: &Access<'_>, object: ObjectId, value: Value) -> Result<()> {
+    /// Stage a replacement value for an existing data object.
+    pub fn write(&self, access: &Access<'_>, object: ObjectId, value: Value) -> Result<()> {
         let st = self.fs.state.read().unwrap();
-        if let Body::Capability(_) = st.verify(self.fs.issuer, access, object, Rights::WRITE)?.body {
+        let obj = st.verify(self.fs.domain, access, object, Rights::WRITE)?;
+        let Body::Data { version, .. } = obj.body else {
             return Err(Error::Unsupported { object, op: "write" });
-        }
-        self.writes.push((object, value, Who::of(access)));
+        };
+        let mut staging = self.staging.borrow_mut();
+        staging.bases.entry(object).or_insert(version);
+        staging.stage(object, value, Who::of(access));
+        self.fs.record(&obj.names, object, Who::of(access), EventKind::Staged);
         Ok(())
     }
 
-    pub fn commit(self) -> Result<()> {
+    /// Stage a new data object at an unbound name. Staging the same name
+    /// again replaces the staged value. The object's identity is fixed now;
+    /// it becomes visible only on commit.
+    pub fn create(&self, access: &Access<'_>, path: &Path, value: Value) -> Result<ObjectId> {
         let mut st = self.fs.state.write().unwrap();
-        for &(object, seen) in &self.reads {
-            match st.objects[&object].body {
-                Body::Data { version, .. } if version == seen => {}
-                _ => return Err(Error::Conflict(object)),
+        st.verify_bind(self.fs.domain, access, path)?;
+        let mut staging = self.staging.borrow_mut();
+        let object = match staging.created_at(path) {
+            Some(object) => object,
+            None => {
+                bindable(&st.names, path)?;
+                let staged: BTreeMap<Path, ()> = staging.creates.values().map(|p| (p.clone(), ())).collect();
+                bindable(&staged, path)?;
+                let object = st.ids.object();
+                staging.creates.insert(object, path.clone());
+                object
+            }
+        };
+        staging.stage(object, value, Who::of(access));
+        self.fs.record(NO_NAMES, object, Who::of(access), EventKind::Staged);
+        Ok(object)
+    }
+
+    /// Invoke a capability. An effectful capability acts inside this
+    /// transaction with exactly the `attached` grants.
+    pub fn invoke(
+        &self,
+        access: &Access<'_>,
+        object: ObjectId,
+        input: Value,
+        attached: NodeGrants<'_>,
+    ) -> Result<Value> {
+        let capability = {
+            let st = self.fs.state.read().unwrap();
+            match &st.verify(self.fs.domain, access, object, Rights::INVOKE)?.body {
+                Body::Capability(c) => Arc::clone(c),
+                Body::Data { .. } => return Err(Error::Unsupported { object, op: "invoke" }),
+            }
+        };
+        let effects = match capability.meta().purity {
+            Purity::Pure => None,
+            Purity::Effectful => Some(Effects { tx: self, grants: attached, cause: access.cause }),
+        };
+        let result = capability.invoke(&CallContext { object, effects }, input);
+        let st = self.fs.state.read().unwrap();
+        self.fs.record(&st.objects[&object].names, object, Who::of(access), EventKind::Invoked { ok: result.is_ok() });
+        result.map_err(|fault| match fault {
+            Fault::InvalidInput(message) => Error::InvalidInput { object, message },
+            Fault::Failed(message) => Error::Capability { object, message },
+            Fault::Substrate(e) => e,
+        })
+    }
+
+    fn check(&self, st: &State) -> Result<()> {
+        let staging = self.staging.borrow();
+        let unchanged = |object: &ObjectId, seen: &u64| match st.objects.get(object).map(|o| &o.body) {
+            Some(Body::Data { version, .. }) => version == seen,
+            _ => false,
+        };
+        for (object, seen) in staging.reads.iter().chain(&staging.bases) {
+            if !unchanged(object, seen) {
+                return Err(Error::Conflict(*object));
             }
         }
-        for (_, _, who) in &self.writes {
-            let grant = who.grant.expect("staged writes carry a grant");
+        for (object, path) in &staging.creates {
+            bindable(&st.names, path).map_err(|_| Error::Conflict(*object))?;
+        }
+        for who in staging.who.values() {
+            let grant = who.grant.expect("staged changes carry a grant");
             if !st.live.contains(&grant) {
                 return Err(Error::InvalidGrant(grant));
             }
         }
-        for (object, value, who) in self.writes {
-            let obj = st.objects.get_mut(&object).expect("verified at staging");
-            let Body::Data { value: slot, version } = &mut obj.body else { unreachable!("verified at staging") };
-            *slot = Some(value);
-            *version += 1;
-            let version = *version;
-            self.fs.record(&obj.names, object, who, EventKind::Written { version });
+        Ok(())
+    }
+
+    /// Apply every staged change atomically, or none of them.
+    pub fn commit(self) -> Result<()> {
+        let mut st = self.fs.state.write().unwrap();
+        if let Err(e) = self.check(&st) {
+            drop(st);
+            self.rollback();
+            return Err(e);
+        }
+        let mut staging = self.staging.into_inner();
+        for object in std::mem::take(&mut staging.order) {
+            let value = staging.values.remove(&object).expect("ordered objects are staged");
+            let who = staging.who[&object];
+            let version = match staging.creates.get(&object) {
+                Some(path) => {
+                    st.insert(object, path, Body::Data { value, version: 1 });
+                    self.fs.record(&st.objects[&object].names, object, who, EventKind::Bound(path.clone()));
+                    1
+                }
+                None => {
+                    let Body::Data { value: slot, version } = &mut st.objects.get_mut(&object).expect("checked").body
+                    else {
+                        unreachable!("only data objects are staged")
+                    };
+                    *slot = value;
+                    *version += 1;
+                    *version
+                }
+            };
+            self.fs.record(&st.objects[&object].names, object, who, EventKind::Written { version });
         }
         Ok(())
+    }
+
+    /// Discard every staged change, journaling that it was discarded.
+    pub fn rollback(self) {
+        let staging = self.staging.into_inner();
+        let st = self.fs.state.read().unwrap();
+        for object in staging.order {
+            let names = st.objects.get(&object).map_or(NO_NAMES, |o| &o.names);
+            self.fs.record(names, object, staging.who[&object], EventKind::RolledBack);
+        }
     }
 }
 
@@ -562,10 +770,10 @@ mod tests {
         fn meta(&self) -> CapabilityMeta {
             CapabilityMeta { purity: Purity::Pure }
         }
-        fn invoke(&self, _: &CallContext<'_>, input: Value) -> std::result::Result<Value, String> {
+        fn invoke(&self, _: &CallContext<'_>, input: Value) -> std::result::Result<Value, Fault> {
             match input {
                 Value::Int(i) => Ok(Value::Int(i * 2)),
-                other => Err(format!("expected int, got {}", other.kind())),
+                other => Err(Fault::InvalidInput(format!("expected int, got {}", other.kind()))),
             }
         }
     }
@@ -576,9 +784,27 @@ mod tests {
         fn meta(&self) -> CapabilityMeta {
             CapabilityMeta { purity: Purity::Pure }
         }
-        fn invoke(&self, cx: &CallContext<'_>, _: Value) -> std::result::Result<Value, String> {
+        fn invoke(&self, cx: &CallContext<'_>, _: Value) -> std::result::Result<Value, Fault> {
             cx.effects()?;
             Ok(Value::Null)
+        }
+    }
+
+    /// Effectful: writes its input to every attached path.
+    struct Fanout;
+    impl Invoke for Fanout {
+        fn meta(&self) -> CapabilityMeta {
+            CapabilityMeta { purity: Purity::Effectful }
+        }
+        fn invoke(&self, cx: &CallContext<'_>, input: Value) -> std::result::Result<Value, Fault> {
+            let fx = cx.effects()?;
+            for entry in fx.grants() {
+                fx.write(&entry.path, input.clone())?;
+            }
+            match input.as_text() {
+                Some(path) => fx.write(&Path::parse(path)?, input.clone()).map(|_| Value::Null).map_err(Fault::from),
+                None => Ok(Value::Null),
+            }
         }
     }
 
@@ -591,6 +817,7 @@ mod tests {
         let r = root(&host);
         fs.mount(&r, &p("/tools/double"), Arc::new(Double)).unwrap();
         fs.mount(&r, &p("/tools/sneaky"), Arc::new(Sneaky)).unwrap();
+        fs.mount(&r, &p("/tools/fanout"), Arc::new(Fanout)).unwrap();
         fs.bind(&r, &p("/memory/secret"), "s".into()).unwrap();
         (fs, host)
     }
@@ -600,6 +827,10 @@ mod tests {
             .allow(p("/tools"), Rights::INVOKE)
             .allow(p("/state"), Rights::READ | Rights::WRITE)
             .allow(p("/memory"), Rights::READ)
+    }
+
+    fn access(grants: &GrantSet, i: usize) -> Access<'_> {
+        grants.access(grants.issued(i).unwrap().id()).unwrap()
     }
 
     #[test]
@@ -615,28 +846,23 @@ mod tests {
     }
 
     #[test]
-    fn issue_resolves_policy_into_object_grants() {
-        let (fs, _) = setup();
+    fn issue_is_observational_and_per_use() {
+        let (fs, host) = setup();
+        let before = fs.snapshot(&root(&host), &Path::root()).unwrap();
         let request = AuthorityRequest::new("agent")
             .want(p("/tools/double"), Rights::INVOKE)
             .want(p("/state/agent/out"), Rights::WRITE);
         let grants = fs.issue(&policy(), &request).unwrap();
+        assert_eq!(fs.snapshot(&root(&host), &Path::root()).unwrap(), before, "issuing changes nothing");
+
         let double = fs.resolve(&p("/tools/double")).unwrap();
-        let out = fs.resolve(&p("/state/agent/out")).expect("provisioned");
+        assert_eq!(grants.issued(0).unwrap().target(), &Target::Object(double));
+        assert_eq!(grants.issued(1).unwrap().target(), &Target::Name(p("/state/agent/out")));
+        assert_eq!(fs.invoke(&access(&grants, 0), double, Value::Int(21)).unwrap(), Value::Int(42));
 
-        let invoke = grants.for_object(double).unwrap();
-        assert_eq!(invoke.rights(), Rights::INVOKE);
-        let access = grants.access(invoke.id()).unwrap();
-        assert_eq!(fs.invoke(&access, double, Value::Int(21)).unwrap(), Value::Int(42));
-
-        // The invoke grant names one object; it is no key to anything else.
-        assert_eq!(fs.write(&access, out, Value::Null), Err(Error::Denied { object: out, needed: Rights::WRITE }));
+        // The invoke grant is no key to anything else.
         let secret = fs.resolve(&p("/memory/secret")).unwrap();
-        assert!(matches!(fs.read(&access, secret), Err(Error::Denied { .. })));
-
-        let write = grants.access(grants.for_object(out).unwrap().id()).unwrap();
-        assert_eq!(fs.write(&write, out, "x".into()).unwrap(), 1);
-        assert_eq!(fs.read(&write, out), Err(Error::Denied { object: out, needed: Rights::READ }));
+        assert!(matches!(fs.read(&access(&grants, 0), secret), Err(Error::Denied { .. })));
     }
 
     #[test]
@@ -647,33 +873,30 @@ mod tests {
             .want(p("/memory/secret"), Rights::WRITE);
         let e = fs.issue(&policy(), &escalate).unwrap_err();
         assert_eq!(e, Error::PolicyDenied { path: p("/memory/secret"), rights: Rights::WRITE });
-        assert_eq!(fs.resolve(&p("/state/fresh")), None, "nothing provisioned on failure");
 
         let missing = AuthorityRequest::new("agent").want(p("/tools/nope"), Rights::INVOKE);
         assert_eq!(fs.issue(&policy(), &missing).unwrap_err(), Error::Unbound(p("/tools/nope")));
+        let nested = AuthorityRequest::new("agent").want(p("/tools/double/x"), Rights::WRITE);
+        assert!(fs.issue(&Policy::default().allow(Path::root(), Rights::WRITE), &nested).is_err());
     }
 
     #[test]
-    fn grants_are_bound_to_their_issuer_and_lifetime() {
+    fn grants_belong_to_their_live_domain() {
         let (fs, _) = setup();
-        let (other, _) = MeatFs::genesis(Seed::fixed(2));
-        let r2 = other.issue(&Policy::default(), &AuthorityRequest::new("x")).unwrap();
-        assert_eq!(r2.iter().count(), 0);
-
         let request = AuthorityRequest::new("agent").want(p("/tools/double"), Rights::INVOKE);
         // An identically seeded twin issues byte-identical grant ids; they must
         // still be worthless here, even once `fs` has issued the same ids.
         let (twin, _) = setup();
         let foreign = twin.issue(&policy(), &request).unwrap();
-        let _same_ids = fs.issue(&policy(), &request).unwrap();
+        let ours = fs.issue(&policy(), &request).unwrap();
+        assert_eq!(foreign.issued(0).unwrap().id(), ours.issued(0).unwrap().id());
+        assert_ne!(foreign.domain(), ours.domain());
         let double = fs.resolve(&p("/tools/double")).unwrap();
-        let access = foreign.access(foreign.iter().next().unwrap().id()).unwrap();
-        assert!(matches!(fs.invoke(&access, double, Value::Int(1)), Err(Error::InvalidGrant(_))));
+        assert!(matches!(fs.invoke(&access(&foreign, 0), double, Value::Int(1)), Err(Error::InvalidGrant(_))));
 
-        let grants = fs.issue(&policy(), &request).unwrap();
-        let id = grants.iter().next().unwrap().id();
-        assert!(fs.invoke(&grants.access(id).unwrap(), double, Value::Int(1)).is_ok());
-        fs.retire(grants);
+        let id = ours.issued(0).unwrap().id();
+        assert!(fs.invoke(&access(&ours, 0), double, Value::Int(1)).is_ok());
+        fs.retire(ours);
         assert!(!fs.state.read().unwrap().live.contains(&id));
     }
 
@@ -681,8 +904,36 @@ mod tests {
     fn pure_capabilities_get_no_effects() {
         let (fs, host) = setup();
         let sneaky = fs.resolve(&p("/tools/sneaky")).unwrap();
-        let e = fs.invoke(&root(&host), sneaky, Value::Null).unwrap_err();
-        assert_eq!(e, Error::Capability { object: sneaky, message: "pure capability attempted an effect".into() });
+        assert_eq!(fs.invoke(&root(&host), sneaky, Value::Null), Err(Error::Impure(sneaky)));
+    }
+
+    #[test]
+    fn effects_are_limited_to_attached_grants() {
+        let (fs, host) = setup();
+        let request = AuthorityRequest::new("agent")
+            .want(p("/tools/fanout"), Rights::INVOKE)
+            .want(p("/state/mine"), Rights::WRITE)
+            .want(p("/state/other"), Rights::WRITE);
+        let grants = fs.issue(&policy(), &request).unwrap();
+        let fanout = fs.resolve(&p("/tools/fanout")).unwrap();
+        let attached = [NodeGrant { path: p("/state/mine"), grant: grants.issued(1).unwrap().id() }];
+        let node = NodeGrants::new(&grants, &attached).unwrap();
+
+        // Writing what is attached works, inside the caller's transaction.
+        let tx = fs.transaction();
+        tx.invoke(&access(&grants, 0), fanout, Value::Int(1), node).unwrap();
+        assert_eq!(fs.resolve(&p("/state/mine")), None, "staged, not yet visible");
+        tx.commit().unwrap();
+        let mine = fs.resolve(&p("/state/mine")).unwrap();
+        assert_eq!(fs.read(&root(&host), mine).unwrap(), Value::Int(1));
+
+        // The set also holds a grant for /state/other, but it is not attached.
+        let tx = fs.transaction();
+        let none = NodeGrants::empty(&grants);
+        let e = tx.invoke(&access(&grants, 0), fanout, "/state/other".into(), none).unwrap_err();
+        assert_eq!(e, Error::NotAttached(p("/state/other")));
+        tx.rollback();
+        assert_eq!(fs.resolve(&p("/state/other")), None);
     }
 
     #[test]
@@ -692,18 +943,17 @@ mod tests {
         let grants = fs.issue(&policy(), &request).unwrap();
         let double = fs.resolve(&p("/tools/double")).unwrap();
         let cause = Cause { execution: fs.new_execution(), node: NodeId(3) };
-        let grant = grants.iter().next().unwrap();
-        let access = grants.access(grant.id()).unwrap().caused_by(cause);
-        fs.invoke(&access, double, Value::Int(1)).unwrap();
+        let a = access(&grants, 0).caused_by(cause);
+        fs.invoke(&a, double, Value::Int(1)).unwrap();
 
-        let events = fs.execution_events(&access).unwrap();
+        let events = fs.execution_events(&a).unwrap();
         assert_eq!(events.len(), 1);
         let e = &events[0];
         assert_eq!(
             (e.object, e.principal, e.grant, e.cause),
-            (double, grants.principal(), Some(grant.id()), Some(cause))
+            (double, grants.principal(), Some(a.grant().id()), Some(cause))
         );
-        assert_eq!(fs.journal(&root(&host), &p("/tools")).unwrap().len(), 3, "two mounts and one invoke");
+        assert_eq!(fs.journal(&root(&host), &p("/tools")).unwrap().len(), 4, "three mounts and one invoke");
     }
 
     #[test]
@@ -717,24 +967,33 @@ mod tests {
     }
 
     #[test]
-    fn transactions_are_atomic_and_detect_conflicts() {
+    fn transactions_are_atomic_and_journaled_either_way() {
         let (fs, host) = setup();
         let r = root(&host);
         let n = fs.bind(&r, &p("/state/n"), Value::Int(1)).unwrap();
         let m = fs.bind(&r, &p("/state/m"), Value::Int(0)).unwrap();
 
-        let mut tx = fs.transaction();
+        let tx = fs.transaction();
         tx.read(&r, n).unwrap();
         tx.write(&r, m, Value::Int(2)).unwrap();
+        tx.create(&r, &p("/state/new"), Value::Int(3)).unwrap();
+        assert_eq!(tx.read(&r, m).unwrap(), Value::Int(2), "reads see staged writes");
         fs.write(&r, n, Value::Int(9)).unwrap();
         assert_eq!(tx.commit(), Err(Error::Conflict(n)));
         assert_eq!(fs.read(&r, m).unwrap(), Value::Int(0));
+        assert_eq!(fs.resolve(&p("/state/new")), None);
+        let kinds: Vec<_> = fs.journal(&r, &p("/state/m")).unwrap().into_iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds[1..],
+            [EventKind::Staged, EventKind::Read { version: 1 }, EventKind::RolledBack, EventKind::Read { version: 1 }]
+        );
 
-        let mut tx = fs.transaction();
+        let tx = fs.transaction();
         tx.write(&r, n, Value::Int(10)).unwrap();
-        tx.write(&r, m, Value::Int(20)).unwrap();
+        let new = tx.create(&r, &p("/state/new"), Value::Int(20)).unwrap();
         tx.commit().unwrap();
-        assert_eq!(fs.read(&r, m).unwrap(), Value::Int(20));
+        assert_eq!(fs.resolve(&p("/state/new")), Some(new));
+        assert_eq!(fs.read(&r, new).unwrap(), Value::Int(20));
     }
 
     #[test]

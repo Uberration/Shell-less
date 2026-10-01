@@ -1,14 +1,15 @@
 //! `shell-less`: MEATYAML → MEAT IR → authority resolution → resolved
-//! execution graph → MeatFS objects → execution receipt.
+//! execution graph → transactional execution → execution receipt.
 //!
 //! ```text
 //! shell-less check <program.meat.yaml>              compile and validate only
 //! shell-less run [--seed N] <program.meat.yaml>     load, execute, print the receipt
 //! ```
 
-use capability::builtin::{Echo, Upper};
-use meatfs::{EventKind, GrantSet, MeatFs, NodeKind, ObjectId, Path, Policy, Rights, Seed, Value};
-use meatyaml::Program;
+use capability::builtin::{Echo, Fail, Upper};
+use meatfs::{EventKind, GrantSet, MeatFs, NodeKind, Path, Policy, Rights, Seed, Target, Value};
+use meatyaml::{EdgeKind, Program};
+use runtime::{ExecutionReceipt, ResolvedTarget};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -24,7 +25,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     match drive(command, seed, file) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -32,58 +34,48 @@ fn main() -> ExitCode {
     }
 }
 
-fn drive(command: &str, seed: Option<u64>, file: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Returns whether the execution committed.
+fn drive(command: &str, seed: Option<u64>, file: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let source = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
     let program = meatyaml::compile(&source)?;
     section("MEAT IR");
     print_ir(&program);
     if command == "check" {
-        return Ok(());
+        return Ok(true);
     }
 
     let (fs, host) = boot(seed.map_or_else(Seed::entropy, Seed::fixed))?;
     let loaded = runtime::load(&fs, &policy()?, &program)?;
 
     section("resolved");
-    for (node, binding) in loaded.graph().nodes.iter().zip(loaded.bindings()) {
-        let rights = loaded.grants().get(binding.grant).map(|g| g.rights()).unwrap_or_default();
+    for (node, resolved) in loaded.graph().nodes.iter().zip(loaded.nodes()) {
+        let target = match &resolved.target {
+            ResolvedTarget::Object(o) => o.short(),
+            ResolvedTarget::New(_) => "<new>".to_owned(),
+        };
+        let uses: String = resolved.uses.iter().map(|u| format!("  +{} {}", u.path, u.grant.short())).collect();
         println!(
-            "  {}  {:<6} {}  {}  {} [{rights}]",
+            "  {}  {:<6} {}  {target}  {}{uses}",
             node.id,
             node.op.name(),
             node.op.target(),
-            binding.object.short(),
-            binding.grant.short()
+            resolved.grant.short()
         );
     }
 
-    let receipt = runtime::execute(&fs, &loaded)?;
+    let receipt = runtime::execute(&fs, &loaded);
     section("receipt");
-    println!("  execution  {}", receipt.execution);
-    println!("  graph      {}", receipt.graph);
-    println!("  principal  {} ({})", receipt.principal, program.agent);
-    for g in &receipt.grants {
-        println!("  grant      {}  {} [{}]", g.grant.short(), g.object.short(), g.rights);
-    }
-    for n in &receipt.nodes {
-        println!("  node       {}  {:<6} {}  {}  → {}", n.node, n.op, n.object.short(), n.grant.short(), n.output);
-    }
-    for e in &receipt.events {
-        let node = e.cause.map(|c| c.node.to_string()).unwrap_or_default();
-        let grant = e.grant.map(|g| g.short()).unwrap_or_default();
-        println!("  event      #{:<3} {node}  {}  {grant}  {}", e.seq, e.object.short(), kind(&e.kind));
-    }
-    println!("  result     {}", receipt.result);
+    print_receipt(&program, &receipt);
 
     section("namespace");
     let root = root(&host);
-    for (path, object, node_kind) in fs.walk(&root, &Path::root())? {
-        match node_kind {
-            NodeKind::Data => println!("  {}  {path} = {}", object.short(), read_or_empty(&fs, &host, object)),
+    for (path, object, kind) in fs.walk(&root, &Path::root())? {
+        match kind {
+            NodeKind::Data => println!("  {}  {path} = {}", object.short(), fs.read(&root, object)?),
             NodeKind::Capability => println!("  {}  {path}  <capability>", object.short()),
         }
     }
-    Ok(())
+    Ok(receipt.succeeded())
 }
 
 /// The host namespace: native capabilities and seed memory.
@@ -92,6 +84,7 @@ fn boot(seed: Seed) -> meatfs::Result<(MeatFs, GrantSet)> {
     let root = root(&host);
     capability::mount(&fs, &root, &Path::parse("/tools/echo")?, Echo)?;
     capability::mount(&fs, &root, &Path::parse("/tools/text/upper")?, Upper)?;
+    capability::mount(&fs, &root, &Path::parse("/tools/test/fail")?, Fail)?;
     fs.bind(&root, &Path::parse("/memory/context")?, Value::map([("text", Value::from("shell-less boot"))]))?;
     Ok((fs, host))
 }
@@ -108,14 +101,6 @@ fn root(host: &GrantSet) -> meatfs::Access<'_> {
     host.access(host.iter().next().expect("genesis issues the root grant").id()).expect("grant is in its set")
 }
 
-fn read_or_empty(fs: &MeatFs, host: &GrantSet, object: ObjectId) -> String {
-    match fs.read(&root(host), object) {
-        Ok(v) => v.to_string(),
-        Err(meatfs::Error::Empty(_)) => "<empty>".to_owned(),
-        Err(e) => format!("<{e}>"),
-    }
-}
-
 fn print_ir(program: &Program) {
     let graph = &program.graph;
     println!("  agent  {}", program.agent);
@@ -126,10 +111,66 @@ fn print_ir(program: &Program) {
     for node in &graph.nodes {
         let literal = node.op.literal().map(|v| format!(" ← {v}")).unwrap_or_default();
         let label = node.label.as_deref().map(|l| format!("  ({l})")).unwrap_or_default();
-        println!("  {}  {:<6} {}{literal}{label}", node.id, node.op.name(), node.op.target());
+        let uses: String = node.op.uses().iter().map(|u| format!("  +{} [{}]", u.path, u.rights)).collect();
+        println!("  {}  {:<6} {}{literal}{uses}{label}", node.id, node.op.name(), node.op.target());
     }
     for edge in &graph.edges {
-        println!("  edge   {} → {}", edge.from, edge.to);
+        let kind = match edge.kind {
+            EdgeKind::Data => "data ",
+            EdgeKind::Order => "order",
+        };
+        println!("  {kind}  {} → {}", edge.from, edge.to);
+    }
+    for output in &graph.outputs {
+        println!("  output {} ← {}", output.name, output.source);
+    }
+}
+
+fn print_receipt(program: &Program, receipt: &ExecutionReceipt) {
+    println!("  execution  {}", receipt.execution);
+    println!("  graph      {}", receipt.graph);
+    println!("  principal  {} ({})", receipt.principal, program.agent);
+    for g in &receipt.grants {
+        let target = match &g.target {
+            Target::Object(o) => o.short(),
+            Target::Name(p) => format!("name {p}"),
+            Target::Namespace(p) => format!("namespace {p}"),
+        };
+        println!("  grant      {}  {target} [{}]", g.grant.short(), g.rights);
+    }
+    let schedule: Vec<_> = receipt.schedule.iter().map(ToString::to_string).collect();
+    println!("  schedule   {}", schedule.join(" → "));
+    for n in &receipt.nodes {
+        let object = n.object.map(|o| o.short()).unwrap_or_else(|| "-".to_owned());
+        let detail = match (&n.output, &n.error) {
+            (_, Some(e)) => format!("{:?}", e.kind),
+            (Some(v), None) => format!("→ {v}"),
+            (None, None) => String::new(),
+        };
+        println!(
+            "  node       {}  {:<6} {:<9} {object}  {}  {detail}",
+            n.node,
+            n.op,
+            format!("{:?}", n.state),
+            n.grant.short()
+        );
+    }
+    for e in &receipt.events {
+        let node = e.cause.map(|c| c.node.to_string()).unwrap_or_default();
+        let grant = e.grant.map(|g| g.short()).unwrap_or_default();
+        println!("  event      #{:<3} {node}  {}  {grant}  {}", e.seq, e.object.short(), kind(&e.kind));
+    }
+    println!("  transaction {:?}", receipt.transaction);
+    if let Some(e) = &receipt.error {
+        println!("  error      {e}");
+    }
+    match receipt.outputs.get("result") {
+        Some(result) if receipt.outputs.len() == 1 => println!("  result     {result}"),
+        _ => {
+            for (name, value) in &receipt.outputs {
+                println!("  output     {name} = {value}");
+            }
+        }
     }
 }
 
@@ -137,7 +178,9 @@ fn kind(kind: &EventKind) -> String {
     match kind {
         EventKind::Bound(path) => format!("bound {path}"),
         EventKind::Read { version } => format!("read v{version}"),
-        EventKind::Written { version } => format!("write v{version}"),
+        EventKind::Staged => "staged".to_owned(),
+        EventKind::Written { version } => format!("written v{version}"),
+        EventKind::RolledBack => "rolled back".to_owned(),
         EventKind::Invoked { ok } => format!("invoke {}", if *ok { "ok" } else { "failed" }),
     }
 }
