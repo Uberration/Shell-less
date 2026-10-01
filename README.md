@@ -7,8 +7,13 @@ MEAT filesystem / execution substrate
  ├── agents
  ├── models
  ├── memory
- └── tools        (typed capabilities, never `exec(string)`)
+ ├── tools          (typed capabilities, never `exec(string)`)
+ ├── state
+ ├── events
+ └── orchestration
 ```
+
+The model is just another component attached to the substrate.
 
 ## Laws
 
@@ -17,6 +22,9 @@ MEAT filesystem / execution substrate
 - **MEATYAML is software.** A program compiles to a validated typed graph and then executes. It is not config for an interpreter.
 - Assembly is the execution substrate. Hot paths collapse into generated native code (Speck / MEATASM).
 - No shell, Python, Node, SaaS or vendor framework as foundation.
+- FUSE / 9P / remote transports are interface options over MeatFS, never the object model.
+- Speck / MEATASM sits beneath the runtime as a compilation target, not handwritten assembly everywhere.
+- Hydra stays outside Shell-less; later it becomes the distributed placement layer for its jobs.
 
 ## Milestone one
 
