@@ -1,18 +1,22 @@
-# The smallest coherent Shell-less program.
+# Milestone 2 acceptance program.
 agent:
   name: echoer
 
-input:
-  /tools/echo: invoke
+authority:
+  - path: /tools/echo
+    rights: [invoke]
 
-output:
-  /state/result: write
+  - path: /state/result
+    rights: [write]
 
 flow:
-  - invoke:
+  - id: make_meat
+    invoke:
       path: /tools/echo
       input:
-        text: "MEAT"
-  - write:
+        text: MEAT
+
+  - id: store
+    write:
       path: /state/result
-      from: previous
+      from: make_meat

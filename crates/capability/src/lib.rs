@@ -7,11 +7,11 @@
 
 pub mod builtin;
 
-use meatfs::{Authority, Invoke, MeatFs, Path, Value};
+use meatfs::{Access, Invoke, MeatFs, ObjectId, Path, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub use meatfs::CallContext as CapabilityContext;
+pub use meatfs::{CallContext as CapabilityContext, CapabilityMeta, Purity};
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -35,6 +35,9 @@ pub trait Capability: Send + Sync + 'static {
     /// One line stating what this capability does.
     fn describe(&self) -> &'static str;
 
+    /// Declared explicitly by every capability; there is no default.
+    fn meta(&self) -> CapabilityMeta;
+
     fn invoke(&self, ctx: &CapabilityContext<'_>, input: Self::Input) -> Result<Self::Output>;
 }
 
@@ -42,6 +45,10 @@ pub trait Capability: Send + Sync + 'static {
 struct Typed<C>(C);
 
 impl<C: Capability> Invoke for Typed<C> {
+    fn meta(&self) -> CapabilityMeta {
+        self.0.meta()
+    }
+
     fn invoke(&self, ctx: &CapabilityContext<'_>, input: Value) -> Result<Value> {
         let input = C::Input::from_value(input).map_err(|e| format!("invalid input: {e}"))?;
         self.0.invoke(ctx, input).map(IntoValue::into_value)
@@ -50,15 +57,16 @@ impl<C: Capability> Invoke for Typed<C> {
     fn signature(&self) -> Value {
         Value::map([
             ("describe", Value::from(self.0.describe())),
+            ("pure", Value::Bool(self.0.meta().purity == Purity::Pure)),
             ("input", C::Input::schema()),
             ("output", C::Output::schema()),
         ])
     }
 }
 
-/// Mount a typed capability at `path`.
-pub fn mount<C: Capability>(fs: &MeatFs, auth: &Authority, path: &Path, capability: C) -> meatfs::Result<()> {
-    fs.mount(auth, path, Arc::new(Typed(capability)))
+/// Mount a typed capability at `path`, returning its identity.
+pub fn mount<C: Capability>(fs: &MeatFs, access: &Access<'_>, path: &Path, capability: C) -> meatfs::Result<ObjectId> {
+    fs.mount(access, path, Arc::new(Typed(capability)))
 }
 
 /// Field access over a map-shaped input, for hand-written [`FromValue`] impls.
@@ -136,33 +144,37 @@ impl IntoValue for Value {
 mod tests {
     use super::builtin::{Echo, Text};
     use super::*;
+    use meatfs::Seed;
+
+    fn echo() -> (MeatFs, meatfs::GrantSet, ObjectId) {
+        let (fs, host) = MeatFs::genesis(Seed::fixed(0));
+        let root = host.access(host.iter().next().unwrap().id()).unwrap();
+        let id = mount(&fs, &root, &Path::parse("/tools/echo").unwrap(), Echo).unwrap();
+        (fs, host, id)
+    }
 
     #[test]
     fn typed_round_trip_and_signature() {
-        let fs = MeatFs::new();
-        let root = Authority::root("host");
-        let path = Path::parse("/tools/echo").unwrap();
-        mount(&fs, &root, &path, Echo).unwrap();
-
-        let out = fs.invoke(&root, &path, Value::map([("text", Value::from("MEAT"))])).unwrap();
+        let (fs, host, echo) = echo();
+        let root = host.access(host.iter().next().unwrap().id()).unwrap();
+        let out = fs.invoke(&root, echo, Value::map([("text", Value::from("MEAT"))])).unwrap();
         assert_eq!(out, Value::map([("text", Value::from("MEAT"))]));
 
-        let sig = fs.inspect(&root, &path).unwrap().signature;
-        assert_eq!(sig.get("input"), Some(&Text::schema_value()));
+        let inspection = fs.inspect(&root, echo).unwrap();
+        assert_eq!(inspection.meta, Some(CapabilityMeta { purity: Purity::Pure }));
+        assert_eq!(inspection.signature.get("input"), Some(&Text::schema_value()));
     }
 
     #[test]
     fn rejects_ill_typed_input() {
-        let fs = MeatFs::new();
-        let root = Authority::root("host");
-        let path = Path::parse("/tools/echo").unwrap();
-        mount(&fs, &root, &path, Echo).unwrap();
+        let (fs, host, echo) = echo();
+        let root = host.access(host.iter().next().unwrap().id()).unwrap();
         for bad in [
             Value::from("bare"),
             Value::map([("text", Value::Int(1))]),
             Value::map([("text", Value::from("a")), ("extra", Value::Null)]),
         ] {
-            assert!(fs.invoke(&root, &path, bad).is_err());
+            assert!(fs.invoke(&root, echo, bad).is_err());
         }
     }
 }

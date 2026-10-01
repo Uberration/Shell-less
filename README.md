@@ -26,24 +26,34 @@ The model is just another component attached to the substrate.
 - Speck / MEATASM sits beneath the runtime as a compilation target, not handwritten assembly everywhere.
 - Hydra stays outside Shell-less; later it becomes the distributed placement layer for its jobs.
 
-## Milestone one
+## Pipeline
 
 ```text
-MEATYAML → parse → typed graph → capability resolution → execution → filesystem-visible result
+MEATYAML ─compile─▶ MEAT IR ─load─▶ AuthorityRequest ─policy─▶ GrantSet ─▶ resolved graph ─execute─▶ ExecutionReceipt
+                    (nodes + edges)                                        (ObjectId + GrantId per node)
 ```
+
+The IR is the contract. The Rust interpreter in `runtime` is its first backend. Speck/MEATASM and Hydra come later, as further consumers of the same IR.
 
 | crate | role |
 |---|---|
-| `meatfs` | in-memory namespace: data and capability objects, `read`/`write`/`invoke`/`subscribe`/`inspect`, explicit `Authority` on every op, event journal (audit), optimistic transactions |
-| `capability` | typed `Capability` trait (`Input: FromValue`, `Output: IntoValue`), published signatures, built-ins |
-| `meatyaml` | compiles MEATYAML into a `Program`: graph + declared authority, statically checked for least privilege |
-| `runtime` | executes a graph under the program's authority alone |
-| `shell-less` | the demonstration binary |
+| `meatfs` | Namespace. `ObjectId` is identity; paths are names bound to it. Authority subsystem: `Policy` (what may be requested) vs `Grant` (what was issued: unforgeable, issuer-bound, retirable). Every op presents an `Access`. Journal events carry object, principal, grant, execution and node. |
+| `capability` | Typed `Capability` trait with mandatory `CapabilityMeta { purity }`. Pure capabilities receive no effects handle at all. |
+| `meatyaml` | Compiles MEATYAML into MEAT IR: `Graph { id, nodes, edges }`. `from: previous` and labels are source sugar resolved into `Edge`s. `GraphId` is a hash of canonical IR content. |
+| `runtime` | `load` validates the IR, fixes a deterministic order, issues grants and binds each node to `ObjectId` + `GrantId`. `execute` runs it with no name lookups and returns an `ExecutionReceipt`. |
+| `shell-less` | Demonstration binary; prints the receipt the runtime produced. |
 
 ```sh
-cargo run -p shell-less -- run   examples/echo.meat.yaml
-cargo run -p shell-less -- run   examples/scout.meat.yaml
-cargo run -p shell-less -- check examples/escalate.meat.yaml   # rejected: undeclared write
+cargo run -p shell-less -- run --seed 42 examples/echo.meat.yaml       # acceptance program
+cargo run -p shell-less -- run --seed 42 examples/scout.meat.yaml
+cargo run -p shell-less -- check examples/escalate.meat.yaml            # rejected by the compiler: undeclared
+cargo run -p shell-less -- run examples/escalate-declared.meat.yaml     # rejected by host policy at issue
 ```
 
-Authority is enforced twice. `meatyaml` refuses any flow step that its `input`/`output` declarations do not cover. `runtime` then executes with exactly those grants, so MeatFS refuses anything else at run time. No ambient authority exists.
+Authority is checked in three places:
+
+1. The compiler rejects any step that the declared `authority` does not cover.
+2. The host `Policy` refuses to issue anything outside it. Issuing is all-or-nothing.
+3. MeatFS refuses any operation whose presented grant does not cover that object and right.
+
+Knowing a pathname confers nothing. Identical graph, seed and initial state give an identical receipt.

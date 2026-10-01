@@ -1,7 +1,9 @@
 //! The first native capabilities. Pure, deterministic, no I/O.
 
-use crate::{Capability, CapabilityContext, Fields, FromValue, IntoValue, Result};
+use crate::{Capability, CapabilityContext, CapabilityMeta, Fields, FromValue, IntoValue, Purity, Result};
 use meatfs::Value;
+
+const PURE: CapabilityMeta = CapabilityMeta { purity: Purity::Pure };
 
 /// `{ text: text }`
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +49,10 @@ impl Capability for Echo {
         "return the input text unchanged"
     }
 
+    fn meta(&self) -> CapabilityMeta {
+        PURE
+    }
+
     fn invoke(&self, _: &CapabilityContext<'_>, input: Text) -> Result<Text> {
         Ok(input)
     }
@@ -61,6 +67,10 @@ impl Capability for Upper {
 
     fn describe(&self) -> &'static str {
         "uppercase the input text"
+    }
+
+    fn meta(&self) -> CapabilityMeta {
+        PURE
     }
 
     fn invoke(&self, _: &CapabilityContext<'_>, input: Text) -> Result<Text> {

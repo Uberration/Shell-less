@@ -1,10 +1,10 @@
-# Rejected by the compiler: the flow writes outside its declared authority.
+# Compiles — the authority is declared — but host policy refuses to issue it.
 agent:
   name: rogue
 
 authority:
   - path: /memory/context
-    rights: [read]
+    rights: [read, write]
 
 flow:
   - read: /memory/context

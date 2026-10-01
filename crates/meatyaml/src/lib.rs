@@ -1,103 +1,198 @@
 //! MEATYAML: source code for executable composition.
 //!
-//! A MEATYAML program is compiled — not interpreted — into a validated
-//! [`Program`]: a typed execution graph plus the exact authority it requires.
-//! Validation is static and strict: unknown keys are errors, data references
-//! must point backwards, and every path the flow touches must be covered by
-//! the program's declared `input`/`output` authority.
+//! The compiler lowers source into MEAT IR — a [`Graph`] of typed nodes with
+//! explicit data [`Edge`]s — plus the authority the program declares. Source
+//! conveniences such as `from: previous` exist only here; the IR is the
+//! contract every backend consumes.
 //!
 //! ```yaml
 //! agent:
 //!   name: echoer
-//! input:
-//!   /tools/echo: invoke
-//! output:
-//!   /state/result: write
+//! authority:
+//!   - path: /tools/echo
+//!     rights: [invoke]
+//!   - path: /state/result
+//!     rights: [write]
 //! flow:
-//!   - invoke:
+//!   - id: make_meat
+//!     invoke:
 //!       path: /tools/echo
 //!       input:
-//!         text: "MEAT"
-//!   - write:
+//!         text: MEAT
+//!   - id: store
+//!     write:
 //!       path: /state/result
-//!       from: previous
+//!       from: make_meat
 //! ```
 
 mod parse;
 
-use meatfs::{Authority, Grant, Path, Rights, Value};
+use meatfs::{AuthorityRequest, NodeId, Path, Rights, Value};
 use std::fmt;
 
 pub use parse::compile;
 
-/// A compiled MEATYAML program.
+/// A compiled MEATYAML program: IR plus declared authority.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub agent: String,
-    /// Declared authority: the only rights the program will ever hold.
-    pub grants: Vec<Grant>,
+    /// Declared authority scopes: the ceiling the graph was checked against.
+    pub authority: Vec<(Path, Rights)>,
     pub graph: Graph,
 }
 
 impl Program {
-    /// The authority this program executes under. Nothing ambient is added.
-    pub fn authority(&self) -> Authority {
-        self.grants.iter().fold(Authority::new(&self.agent), |auth, g| auth.grant(g.prefix.clone(), g.rights))
+    /// The exact authority the graph needs, one entry per touched path.
+    pub fn request(&self) -> AuthorityRequest {
+        self.graph
+            .nodes
+            .iter()
+            .fold(AuthorityRequest::new(&self.agent), |req, node| req.want(node.op.target().clone(), node.op.rights()))
     }
 }
 
-/// Execution graph. Nodes are stored in a valid execution order and every
-/// [`Source::Node`] refers to an earlier node, so the graph is acyclic by
-/// construction.
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Content identity of a graph: a hash of its canonical encoding.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphId(u128);
+
+impl GraphId {
+    pub fn short(self) -> String {
+        format!("gph:{:08x}", (self.0 >> 96) as u32)
+    }
+}
+
+impl fmt::Display for GraphId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "gph:{:032x}", self.0)
+    }
+}
+
+impl fmt::Debug for GraphId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// MEAT IR.
+///
+/// * Data flows only along `edges`; each node has at most one incoming edge,
+///   which feeds its data input.
+/// * Effects are ordered by [`NodeId`]; the compiler assigns ids in source
+///   order and edges always point from a lower id to a higher one.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Graph {
+    pub id: GraphId,
     pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+}
+
+impl Graph {
+    fn new(nodes: Vec<Node>, edges: Vec<Edge>) -> Graph {
+        let id = GraphId(fnv1a_128(canonical(&nodes, &edges).as_bytes()));
+        Graph { id, nodes, edges }
+    }
+
+    /// The node whose output feeds `node`'s data input.
+    pub fn input_of(&self, node: NodeId) -> Option<NodeId> {
+        self.edges.iter().find(|e| e.to == node).map(|e| e.from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
-    /// Optional name other nodes may reference with `from: <id>`.
-    pub id: Option<String>,
+    pub id: NodeId,
+    /// Source label (`id:` in MEATYAML). Not part of graph identity.
+    pub label: Option<String>,
     pub op: Op,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
-    Read { path: Path },
-    Write { path: Path, value: Source },
-    Invoke { path: Path, input: Source },
+    Read(ReadOp),
+    Write(WriteOp),
+    Invoke(InvokeOp),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadOp {
+    pub target: Path,
+}
+
+/// Writes `value`, or the incoming edge's data when `value` is `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteOp {
+    pub target: Path,
+    pub value: Option<Value>,
+}
+
+/// Invokes with `input`, or the incoming edge's data when `input` is `None`.
+/// With neither, the input is `null`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvokeOp {
+    pub target: Path,
+    pub input: Option<Value>,
 }
 
 impl Op {
-    pub fn path(&self) -> &Path {
+    pub fn target(&self) -> &Path {
         match self {
-            Op::Read { path } | Op::Write { path, .. } | Op::Invoke { path, .. } => path,
+            Op::Read(ReadOp { target }) | Op::Write(WriteOp { target, .. }) | Op::Invoke(InvokeOp { target, .. }) => {
+                target
+            }
         }
     }
 
     pub fn rights(&self) -> Rights {
         match self {
-            Op::Read { .. } => Rights::READ,
-            Op::Write { .. } => Rights::WRITE,
-            Op::Invoke { .. } => Rights::INVOKE,
+            Op::Read(_) => Rights::READ,
+            Op::Write(_) => Rights::WRITE,
+            Op::Invoke(_) => Rights::INVOKE,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            Op::Read { .. } => "read",
-            Op::Write { .. } => "write",
-            Op::Invoke { .. } => "invoke",
+            Op::Read(_) => "read",
+            Op::Write(_) => "write",
+            Op::Invoke(_) => "invoke",
+        }
+    }
+
+    /// The literal data carried by the node itself, if any.
+    pub fn literal(&self) -> Option<&Value> {
+        match self {
+            Op::Read(_) => None,
+            Op::Write(WriteOp { value, .. }) => value.as_ref(),
+            Op::Invoke(InvokeOp { input, .. }) => input.as_ref(),
         }
     }
 }
 
-/// Where a node's data comes from.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Source {
-    Literal(Value),
-    /// The output of the node at this index.
-    Node(usize),
+/// The output of `from` feeds the data input of `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edge {
+    pub from: NodeId,
+    pub to: NodeId,
+}
+
+/// Canonical text form of the semantic content of a graph. Labels are
+/// excluded; maps are already ordered, so equal graphs encode equally.
+fn canonical(nodes: &[Node], edges: &[Edge]) -> String {
+    let mut out = String::from("meat-ir/1\n");
+    for node in nodes {
+        let literal = node.op.literal().map(Value::to_string).unwrap_or_default();
+        out += &format!("node {} {} {} {}\n", node.id, node.op.name(), node.op.target(), literal);
+    }
+    for edge in edges {
+        out += &format!("edge {} {}\n", edge.from, edge.to);
+    }
+    out
+}
+
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013B;
+    bytes.iter().fold(OFFSET, |hash, &b| (hash ^ u128::from(b)).wrapping_mul(PRIME))
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,4 +1,3 @@
-use crate::Path;
 use std::fmt;
 use std::ops::BitOr;
 
@@ -50,60 +49,15 @@ impl fmt::Display for Rights {
     }
 }
 
-/// Rights over a subtree of the namespace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Grant {
-    pub prefix: Path,
-    pub rights: Rights,
-}
-
-/// The explicit authority carried by every operation.
-///
-/// There is no ambient authority: an empty `Authority` can do nothing.
-#[derive(Debug, Clone, Default)]
-pub struct Authority {
-    pub principal: String,
-    grants: Vec<Grant>,
-}
-
-impl Authority {
-    pub fn new(principal: impl Into<String>) -> Self {
-        Self { principal: principal.into(), grants: Vec::new() }
-    }
-
-    /// Full authority over the whole namespace. For the host, never for agents.
-    pub fn root(principal: impl Into<String>) -> Self {
-        Self::new(principal).grant(Path::root(), Rights::ALL)
-    }
-
-    pub fn grant(mut self, prefix: Path, rights: Rights) -> Self {
-        self.grants.push(Grant { prefix, rights });
-        self
-    }
-
-    pub fn grants(&self) -> &[Grant] {
-        &self.grants
-    }
-
-    pub fn allows(&self, path: &Path, needed: Rights) -> bool {
-        let held =
-            self.grants.iter().filter(|g| path.starts_with(&g.prefix)).fold(Rights::NONE, |acc, g| acc | g.rights);
-        held.contains(needed)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn grants_cover_subtrees_only() {
-        let auth = Authority::new("scout")
-            .grant(Path::parse("/state/scout").unwrap(), Rights::WRITE)
-            .grant(Path::parse("/memory").unwrap(), Rights::READ);
-        assert!(auth.allows(&Path::parse("/state/scout/report").unwrap(), Rights::WRITE));
-        assert!(!auth.allows(&Path::parse("/state/other").unwrap(), Rights::WRITE));
-        assert!(!auth.allows(&Path::parse("/memory/x").unwrap(), Rights::WRITE));
-        assert!(!Authority::new("nobody").allows(&Path::root(), Rights::READ));
+    fn contains_and_names() {
+        let rw = Rights::READ | Rights::WRITE;
+        assert!(rw.contains(Rights::READ) && !rw.contains(Rights::INVOKE));
+        assert_eq!(rw.to_string(), "read+write");
+        assert_eq!(Rights::from_name("invoke"), Some(Rights::INVOKE));
     }
 }

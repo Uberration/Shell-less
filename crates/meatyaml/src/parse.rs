@@ -1,5 +1,5 @@
-use crate::{Error, Graph, Node, Op, Program, Source};
-use meatfs::{Grant, Path, Rights, Value};
+use crate::{Edge, Error, Graph, InvokeOp, Node, Op, Program, ReadOp, WriteOp};
+use meatfs::{NodeId, Path, Rights, Value};
 use std::collections::{BTreeMap, HashMap};
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -23,136 +23,136 @@ pub fn compile(source: &str) -> Result<Program> {
         agent.finish()?;
         name
     };
-
-    let mut grants = Vec::new();
-    for section in ["input", "output"] {
-        if let Some(yaml) = top.optional(section) {
-            grants.extend(compile_grants(yaml, section)?);
-        }
-    }
-
-    let flow = match top.require("flow")? {
+    let authority = match top.optional("authority") {
+        Some(yaml) => compile_authority(yaml)?,
+        None => Vec::new(),
+    };
+    let steps = match top.require("flow")? {
         Yaml::Array(steps) if !steps.is_empty() => steps,
         _ => return err("flow", "expected a non-empty list of steps"),
     };
     top.finish()?;
 
-    let mut graph = Graph::default();
-    let mut ids = HashMap::new();
-    for (i, step) in flow.iter().enumerate() {
-        let at = format!("flow[{i}]");
-        let node = compile_step(step, &at, i, &ids)?;
-        if let Some(id) = &node.id {
-            if ids.insert(id.clone(), i).is_some() {
-                return err(at, format!("duplicate id `{id}`"));
-            }
-        }
-        let (path, needed) = (node.op.path(), node.op.rights());
-        let covered = grants
-            .iter()
-            .filter(|g: &&Grant| path.starts_with(&g.prefix))
-            .fold(Rights::NONE, |acc, g| acc | g.rights)
-            .contains(needed);
-        if !covered {
-            return err(format!("{at}.{}", node.op.name()), format!("{path} needs `{needed}`, which is not declared"));
-        }
-        graph.nodes.push(node);
+    let mut compiler = Compiler::default();
+    for (i, step) in steps.iter().enumerate() {
+        compiler.step(step, &format!("flow[{i}]"), &authority)?;
     }
-
-    Ok(Program { agent, grants, graph })
+    Ok(Program { agent, authority, graph: Graph::new(compiler.nodes, compiler.edges) })
 }
 
-fn compile_grants(yaml: &Yaml, section: &str) -> Result<Vec<Grant>> {
-    let Yaml::Hash(entries) = yaml else {
-        return err(section, "expected a map of path: rights");
+fn compile_authority(yaml: &Yaml) -> Result<Vec<(Path, Rights)>> {
+    let Yaml::Array(entries) = yaml else {
+        return err("authority", "expected a list of { path, rights }");
     };
     entries
         .iter()
-        .map(|(key, rights)| {
-            let at = format!("{section}.{}", key.as_str().unwrap_or("?"));
-            let prefix = path(key, &at)?;
-            let names: Vec<&str> = match rights {
+        .enumerate()
+        .map(|(i, entry)| {
+            let at = format!("authority[{i}]");
+            let mut entry = Map::of(entry, &at)?;
+            let prefix = path(entry.require("path")?, &format!("{at}.path"))?;
+            let rights_at = format!("{at}.rights");
+            let names: Vec<&str> = match entry.require("rights")? {
                 Yaml::String(s) => s.split('+').map(str::trim).collect(),
                 Yaml::Array(items) => items.iter().map(|y| y.as_str().unwrap_or("")).collect(),
-                _ => return err(at, "expected rights such as `read`, `read+write` or a list"),
+                _ => return err(rights_at, "expected rights such as [read, write] or `read+write`"),
             };
+            entry.finish()?;
             let rights = names.iter().try_fold(Rights::NONE, |acc, name| match Rights::from_name(name) {
                 Some(r) => Ok(acc | r),
-                None => err(&at, format!("unknown right `{name}`")),
+                None => err(&rights_at, format!("unknown right `{name}`")),
             })?;
-            Ok(Grant { prefix, rights })
+            Ok((prefix, rights))
         })
         .collect()
 }
 
-fn compile_step(step: &Yaml, at: &str, index: usize, ids: &HashMap<String, usize>) -> Result<Node> {
-    let Yaml::Hash(entries) = step else {
-        return err(at, "expected a step such as `read: /path`");
-    };
-    let [(op, body)] = entries.iter().collect::<Vec<_>>()[..] else {
-        return err(at, "a step has exactly one operation");
-    };
-    let op_name = op.as_str().unwrap_or("?");
-    let at = format!("{at}.{op_name}");
-    let previous = index.checked_sub(1).map(Source::Node);
-
-    // Short form: `op: /path`.
-    if let Yaml::String(_) = body {
-        let path = path(body, &at)?;
-        let op = match op_name {
-            "read" => Op::Read { path },
-            "invoke" => Op::Invoke { path, input: previous.unwrap_or(Source::Literal(Value::Null)) },
-            "write" => match previous {
-                Some(value) => Op::Write { path, value },
-                None => return err(at, "nothing to write: no previous step"),
-            },
-            other => return err(at, format!("unknown operation `{other}`")),
-        };
-        return Ok(Node { id: None, op });
-    }
-
-    let mut body = Map::of(body, &at)?;
-    let path = path(body.require("path")?, &format!("{at}.path"))?;
-    let id = body.optional("id").map(|y| text(y, &format!("{at}.id"))).transpose()?;
-    let op = match op_name {
-        "read" => Op::Read { path },
-        "invoke" => {
-            let input = data_source(&mut body, "input", &at, previous, ids)?;
-            Op::Invoke { path, input: input.unwrap_or(Source::Literal(Value::Null)) }
-        }
-        "write" => match data_source(&mut body, "value", &at, previous, ids)? {
-            Some(value) => Op::Write { path, value },
-            None => return err(at, "nothing to write: give `value` or `from`"),
-        },
-        other => return err(at, format!("unknown operation `{other}`")),
-    };
-    body.finish()?;
-    Ok(Node { id, op })
+/// Lowers steps into IR, resolving all source-level references to edges.
+#[derive(Default)]
+struct Compiler {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    labels: HashMap<String, NodeId>,
 }
 
-/// Resolve a step's data from a literal `<literal_key>` or a `from` reference,
-/// defaulting to the previous step.
-fn data_source(
-    body: &mut Map<'_>,
-    literal_key: &str,
-    at: &str,
-    previous: Option<Source>,
-    ids: &HashMap<String, usize>,
-) -> Result<Option<Source>> {
-    match (body.optional(literal_key), body.optional("from")) {
-        (Some(_), Some(_)) => err(at, format!("give either `{literal_key}` or `from`, not both")),
-        (Some(literal), None) => Ok(Some(Source::Literal(value(literal, &format!("{at}.{literal_key}"))?))),
-        (None, Some(from)) => {
-            let at = format!("{at}.from");
-            match text(from, &at)?.as_str() {
-                "previous" => previous.map(Some).ok_or(()).or_else(|_| err(at, "no previous step")),
-                id => match ids.get(id) {
-                    Some(&i) => Ok(Some(Source::Node(i))),
-                    None => err(at, format!("no earlier step with id `{id}`")),
-                },
+impl Compiler {
+    fn step(&mut self, step: &Yaml, at: &str, authority: &[(Path, Rights)]) -> Result<()> {
+        let mut step_map = Map::of(step, at)?;
+        let label = step_map.optional("id").map(|y| text(y, &format!("{at}.id"))).transpose()?;
+        let [(op_name, body)] = step_map.entries.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()[..] else {
+            return err(at, "a step has exactly one operation (plus an optional `id`)");
+        };
+        let at = format!("{at}.{op_name}");
+        let id = NodeId(self.nodes.len() as u32);
+        let previous = self.nodes.last().map(|n| n.id);
+
+        // Short form `op: /path` takes its data from the previous step.
+        let (target, literal, from) = match body {
+            Yaml::String(_) => (path(body, &at)?, None, previous),
+            _ => {
+                let mut body = Map::of(body, &at)?;
+                let target = path(body.require("path")?, &format!("{at}.path"))?;
+                let literal_key = match op_name {
+                    "write" => Some("value"),
+                    "invoke" => Some("input"),
+                    _ => None,
+                };
+                let literal = literal_key.and_then(|k| body.optional(k).map(|y| (k, y)));
+                let from = body.optional("from");
+                body.finish()?;
+                let from = match (literal, from) {
+                    (Some((k, _)), Some(_)) => return err(at, format!("give either `{k}` or `from`, not both")),
+                    (Some(_), None) => None,
+                    (None, Some(from)) => Some(self.reference(from, &format!("{at}.from"), previous)?),
+                    (None, None) => previous,
+                };
+                let literal = literal.map(|(k, y)| value(y, &format!("{at}.{k}"))).transpose()?;
+                (target, literal, from)
+            }
+        };
+
+        let op = match op_name {
+            "read" => Op::Read(ReadOp { target }),
+            "invoke" => Op::Invoke(InvokeOp { target, input: literal }),
+            "write" => {
+                if literal.is_none() && from.is_none() {
+                    return err(at, "nothing to write: give `value` or `from`");
+                }
+                Op::Write(WriteOp { target, value: literal })
+            }
+            other => return err(at, format!("unknown operation `{other}`")),
+        };
+
+        let (target, needed) = (op.target(), op.rights());
+        let declared = authority
+            .iter()
+            .filter(|(prefix, _)| target.starts_with(prefix))
+            .fold(Rights::NONE, |acc, (_, r)| acc | *r);
+        if !declared.contains(needed) {
+            return err(at, format!("{target} needs `{needed}`, which is not declared in `authority`"));
+        }
+
+        // Reads take no data input; everything else is fed by `from`, if any.
+        if let (Some(from), false, None) = (from, matches!(op, Op::Read(_)), op.literal()) {
+            self.edges.push(Edge { from, to: id });
+        }
+        if let Some(label) = &label {
+            if self.labels.insert(label.clone(), id).is_some() {
+                return err(at, format!("duplicate id `{label}`"));
             }
         }
-        (None, None) => Ok(previous),
+        self.nodes.push(Node { id, label, op });
+        Ok(())
+    }
+
+    fn reference(&self, from: &Yaml, at: &str, previous: Option<NodeId>) -> Result<NodeId> {
+        match text(from, at)?.as_str() {
+            "previous" => previous.ok_or(()).or_else(|_| err(at, "no previous step")),
+            label => match self.labels.get(label) {
+                Some(&id) => Ok(id),
+                None => err(at, format!("no earlier step with id `{label}`")),
+            },
+        }
     }
 }
 
@@ -232,21 +232,29 @@ fn value(yaml: &Yaml, at: &str) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// The Milestone 2 acceptance program.
     const ECHO: &str = r#"
 agent:
   name: echoer
-input:
-  /tools/echo: invoke
-output:
-  /state/result: write
+
+authority:
+  - path: /tools/echo
+    rights: [invoke]
+
+  - path: /state/result
+    rights: [write]
+
 flow:
-  - invoke:
+  - id: make_meat
+    invoke:
       path: /tools/echo
       input:
-        text: "MEAT"
-  - write:
+        text: MEAT
+
+  - id: store
+    write:
       path: /state/result
-      from: previous
+      from: make_meat
 "#;
 
     fn p(s: &str) -> Path {
@@ -254,63 +262,83 @@ flow:
     }
 
     #[test]
-    fn compiles_the_canonical_example() {
+    fn compiles_to_ir_with_explicit_edges() {
         let program = compile(ECHO).unwrap();
-        assert_eq!(program.agent, "echoer");
+        let g = &program.graph;
         assert_eq!(
-            program.graph.nodes.iter().map(|n| n.op.clone()).collect::<Vec<_>>(),
+            g.nodes.iter().map(|n| n.op.clone()).collect::<Vec<_>>(),
             vec![
-                Op::Invoke {
-                    path: p("/tools/echo"),
-                    input: Source::Literal(Value::map([("text", Value::from("MEAT"))])),
-                },
-                Op::Write { path: p("/state/result"), value: Source::Node(0) },
+                Op::Invoke(InvokeOp {
+                    target: p("/tools/echo"),
+                    input: Some(Value::map([("text", Value::from("MEAT"))])),
+                }),
+                Op::Write(WriteOp { target: p("/state/result"), value: None }),
             ]
         );
-        let auth = program.authority();
-        assert!(auth.allows(&p("/state/result"), Rights::WRITE));
-        assert!(!auth.allows(&p("/state/result"), Rights::READ));
+        assert_eq!(g.edges, vec![Edge { from: NodeId(0), to: NodeId(1) }]);
+        assert_eq!(g.input_of(NodeId(1)), Some(NodeId(0)));
+        assert_eq!(
+            program.request().wants,
+            vec![(p("/tools/echo"), Rights::INVOKE), (p("/state/result"), Rights::WRITE)]
+        );
     }
 
     #[test]
-    fn short_forms_and_named_references() {
+    fn previous_is_source_sugar_for_an_edge() {
+        let explicit = compile(ECHO).unwrap();
+        let sugar = compile(&ECHO.replace("from: make_meat", "from: previous")).unwrap();
+        let short = compile(
+            &ECHO.replace("    write:\n      path: /state/result\n      from: make_meat", "    write: /state/result"),
+        )
+        .unwrap();
+        assert_eq!(explicit.graph, sugar.graph);
+        assert_eq!(explicit.graph, short.graph);
+    }
+
+    #[test]
+    fn graph_identity_is_content_not_labels() {
+        let a = compile(ECHO).unwrap().graph.id;
+        let relabelled = compile(&ECHO.replace("make_meat", "m")).unwrap().graph.id;
+        let changed = compile(&ECHO.replace("text: MEAT", "text: VEG")).unwrap().graph.id;
+        assert_eq!(a, relabelled);
+        assert_ne!(a, changed);
+    }
+
+    #[test]
+    fn literal_inputs_take_no_edge() {
         let program = compile(
             r#"
-agent: { name: scout }
-input:
-  /memory/context: read
-  /tools: invoke
-output:
-  /state/scout: write
+agent: { name: a }
+authority:
+  - { path: /memory, rights: [read] }
+  - { path: /state/a, rights: read+write }
 flow:
-  - read: { path: /memory/context, id: ctx }
-  - invoke: /tools/web/search
-  - write: /state/scout/report
-  - write: { path: /state/scout/context, from: ctx }
+  - read: /memory/context
+  - write: { path: /state/a/x, value: 1 }
+  - write: { path: /state/a/y, from: previous }
 "#,
         )
         .unwrap();
-        let ops: Vec<_> = program.graph.nodes.into_iter().map(|n| n.op).collect();
-        assert_eq!(ops[1], Op::Invoke { path: p("/tools/web/search"), input: Source::Node(0) });
-        assert_eq!(ops[2], Op::Write { path: p("/state/scout/report"), value: Source::Node(1) });
-        assert_eq!(ops[3], Op::Write { path: p("/state/scout/context"), value: Source::Node(0) });
+        assert_eq!(program.graph.edges, vec![Edge { from: NodeId(1), to: NodeId(2) }]);
     }
 
     #[test]
     fn rejects_undeclared_authority() {
-        let e = compile(&ECHO.replace("/state/result: write", "/state/result: read")).unwrap_err();
+        let e = compile(&ECHO.replace("rights: [write]", "rights: [read]")).unwrap_err();
         assert_eq!(e.at, "flow[1].write");
     }
 
     #[test]
     fn rejects_malformed_programs() {
         let cases = [
-            (ECHO.replace("from: previous", "from: nowhere"), "flow[1].write.from"),
-            (ECHO.replace("from: previous", "from: previous\n      value: 1"), "flow[1].write"),
-            (ECHO.replace("- write:", "- exec:"), "flow[1].exec"),
-            (ECHO.replace("path: /tools/echo", "path: /tools/../etc"), "flow[0].invoke.path"),
+            (ECHO.replace("from: make_meat", "from: nowhere"), "flow[1].write.from"),
+            (ECHO.replace("from: make_meat", "from: make_meat\n      value: 1"), "flow[1].write"),
+            (ECHO.replace("    write:", "    exec:"), "flow[1].exec"),
+            (ECHO.replace("path: /tools/echo\n      input", "path: /tools/../etc\n      input"), "flow[0].invoke.path"),
             (ECHO.replace("  name: echoer", "  name: echoer\n  shell: bash"), "agent"),
-            (ECHO.replace("/tools/echo: invoke", "/tools/echo: root"), "input./tools/echo"),
+            (ECHO.replace("[invoke]", "[root]"), "authority[0].rights"),
+            (ECHO.replace("- id: store", "- id: make_meat"), "flow[1].write"),
+            (ECHO.replace("  - id: store\n", "  - id: store\n    read: /x\n"), "flow[1]"),
         ];
         for (src, at) in cases {
             assert_eq!(compile(&src).unwrap_err().at, at, "{src}");

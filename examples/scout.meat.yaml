@@ -1,18 +1,18 @@
-# Short forms, named references and subtree grants.
+# Short forms, named references and subtree-scoped authority.
 agent:
   name: scout
 
-input:
-  /memory/context: read
-  /tools/text: invoke
-
-output:
-  /state/scout: write
+authority:
+  - path: /memory/context
+    rights: [read]
+  - path: /tools/text
+    rights: [invoke]
+  - path: /state/scout
+    rights: [write]
 
 flow:
-  - read:
-      path: /memory/context
-      id: context
+  - id: context
+    read: /memory/context
   - invoke: /tools/text/upper
   - write: /state/scout/report
   - write:
