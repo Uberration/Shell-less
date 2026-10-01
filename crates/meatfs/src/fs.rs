@@ -480,7 +480,7 @@ impl MeatFs {
     /// Invoke outside any graph: the capability receives no attached grants.
     pub fn invoke(&self, access: &Access<'_>, object: ObjectId, input: Value) -> Result<Value> {
         let tx = self.transaction();
-        match tx.invoke(access, object, input, NodeGrants::empty(access.grants)) {
+        match tx.invoke(access, object, input, NodeGrants::empty(access.grants), None) {
             Ok(output) => tx.commit().map(|_| output),
             Err(e) => {
                 tx.rollback();
@@ -692,12 +692,18 @@ impl Transaction<'_> {
 
     /// Invoke a capability. An effectful capability acts inside this
     /// transaction with exactly the `attached` grants.
+    ///
+    /// With `pinned`, the capability must still declare exactly that
+    /// metadata — the declaration a caller scheduled by — or the call is
+    /// refused with [`Error::DeclarationChanged`] before it runs; the pinned
+    /// purity then decides whether it receives effects.
     pub fn invoke(
         &self,
         access: &Access<'_>,
         object: ObjectId,
         input: Value,
         attached: NodeGrants<'_>,
+        pinned: Option<&CapabilityMeta>,
     ) -> Result<Value> {
         let capability = {
             let st = self.fs.state.read().unwrap();
@@ -706,7 +712,11 @@ impl Transaction<'_> {
                 Body::Data { .. } => return Err(Error::Unsupported { object, op: "invoke" }),
             }
         };
-        let effects = match capability.meta().purity {
+        let declared = capability.meta();
+        if pinned.is_some_and(|p| *p != declared) {
+            return Err(Error::DeclarationChanged(object));
+        }
+        let effects = match declared.purity {
             Purity::Pure => None,
             Purity::Effectful => Some(Effects { tx: self, grants: attached, cause: access.cause }),
         };
@@ -952,7 +962,7 @@ mod tests {
 
         // Writing what is attached works, inside the caller's transaction.
         let tx = fs.transaction();
-        tx.invoke(&access(&grants, 0), fanout, Value::Int(1), node).unwrap();
+        tx.invoke(&access(&grants, 0), fanout, Value::Int(1), node, None).unwrap();
         assert_eq!(fs.resolve(&p("/state/mine")), None, "staged, not yet visible");
         tx.commit().unwrap();
         let mine = fs.resolve(&p("/state/mine")).unwrap();
@@ -961,7 +971,7 @@ mod tests {
         // The set also holds a grant for /state/other, but it is not attached.
         let tx = fs.transaction();
         let none = NodeGrants::empty(&grants);
-        let e = tx.invoke(&access(&grants, 0), fanout, "/state/other".into(), none).unwrap_err();
+        let e = tx.invoke(&access(&grants, 0), fanout, "/state/other".into(), none, None).unwrap_err();
         assert_eq!(e, Error::NotAttached(p("/state/other")));
         tx.rollback();
         assert_eq!(fs.resolve(&p("/state/other")), None);

@@ -1,5 +1,6 @@
 use crate::{
-    Edge, EdgeKind, Error, Graph, GraphOutput, InvokeOp, Node, Op, Program, ReadOp, Selector, Use, ValueExpr, WriteOp,
+    Edge, EdgeKind, Error, ErrorKind, Graph, GraphOutput, InvokeOp, Node, Op, Program, ReadOp, Selector, Use,
+    ValueExpr, WriteOp,
 };
 use meatfs::{NodeId, Path, Rights, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -7,68 +8,118 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 type Result<T> = std::result::Result<T, Error>;
 
-fn err<T>(at: impl Into<String>, message: impl Into<String>) -> Result<T> {
-    Err(Error { at: at.into(), message: message.into() })
+/// A location within a program, kept in two forms: `full`, and `safe`, in
+/// which every source-controlled segment (map keys, unknown operation
+/// names, output names) is replaced by a fixed placeholder.
+#[derive(Debug, Clone, Default)]
+struct Loc {
+    full: String,
+    safe: String,
 }
+
+impl Loc {
+    fn push(&self, full: &str, safe: &str, index: bool) -> Loc {
+        let sep = if index || self.full.is_empty() { "" } else { "." };
+        Loc { full: format!("{}{sep}{full}", self.full), safe: format!("{}{sep}{safe}", self.safe) }
+    }
+
+    /// A fixed grammar label.
+    fn field(&self, label: &'static str) -> Loc {
+        self.push(label, label, false)
+    }
+
+    fn index(&self, i: usize) -> Loc {
+        let i = format!("[{i}]");
+        self.push(&i, &i, true)
+    }
+
+    /// A segment taken from the source text.
+    fn name(&self, name: &str) -> Loc {
+        self.push(name, "<name>", false)
+    }
+
+    /// An operation or constructor name: fixed if the grammar knows it.
+    fn keyword(&self, word: &str, known: &[&'static str]) -> Loc {
+        match known.iter().find(|k| **k == word) {
+            Some(k) => self.field(k),
+            None => self.name(word),
+        }
+    }
+}
+
+fn err<T>(kind: ErrorKind, at: &Loc, detail: impl Into<String>) -> Result<T> {
+    Err(Error { kind, at: at.full.clone(), at_redacted: at.safe.clone(), position: None, detail: detail.into() })
+}
+
+const OPERATIONS: &[&str] = &["read", "write", "invoke", "compose"];
+const CONSTRUCTORS: &[&str] = &["literal", "select", "map", "list"];
 
 /// Compile MEATYAML source into a validated [`Program`].
 pub fn compile(source: &str) -> Result<Program> {
-    let docs = YamlLoader::load_from_str(source).or_else(|e| err("", format!("yaml: {e}")))?;
+    let root = Loc::default();
+    let docs = YamlLoader::load_from_str(source).map_err(|e| Error {
+        kind: ErrorKind::Syntax,
+        at: String::new(),
+        at_redacted: String::new(),
+        position: Some((e.marker().line(), e.marker().col() + 1)),
+        detail: e.info().to_owned(),
+    })?;
     let [doc] = docs.as_slice() else {
-        return err("", "expected exactly one document");
+        return err(ErrorKind::Shape, &root, "expected exactly one document");
     };
-    let mut top = Map::of(doc, "")?;
+    let mut top = Map::of(doc, &root)?;
 
     let agent = {
-        let mut agent = Map::of(top.require("agent")?, "agent")?;
-        let name = text(agent.require("name")?, "agent.name")?;
+        let at = root.field("agent");
+        let mut agent = Map::of(top.require("agent")?, &at)?;
+        let name = text(agent.require("name")?, &at.field("name"))?;
         agent.finish()?;
         name
     };
     let authority = match top.optional("authority") {
-        Some(yaml) => compile_uses(yaml, "authority")?.into_iter().map(|u| (u.path, u.rights)).collect(),
+        Some(yaml) => compile_uses(yaml, &root.field("authority"))?.into_iter().map(|u| (u.path, u.rights)).collect(),
         None => Vec::new(),
     };
     let steps = match top.require("flow")? {
         Yaml::Array(steps) if !steps.is_empty() => steps,
-        _ => return err("flow", "expected a non-empty list of steps"),
+        _ => return err(ErrorKind::Shape, &root.field("flow"), "expected a non-empty list of steps"),
     };
     let outputs = top.optional("outputs");
     top.finish()?;
 
     let mut compiler = Compiler { authority, ..Compiler::default() };
     for (i, step) in steps.iter().enumerate() {
-        compiler.step(step, &format!("flow[{i}]"))?;
+        compiler.step(step, &root.field("flow").index(i))?;
     }
     let outputs = match outputs {
-        Some(yaml) => compiler.outputs(yaml)?,
+        Some(yaml) => compiler.outputs(yaml, &root.field("outputs"))?,
         None => Vec::new(),
     };
     Ok(Program { agent, authority: compiler.authority, graph: Graph::new(compiler.nodes, compiler.edges, outputs) })
 }
 
 /// A list of `{ path, rights }`, as used by `authority` and `uses`.
-fn compile_uses(yaml: &Yaml, at: &str) -> Result<Vec<Use>> {
+fn compile_uses(yaml: &Yaml, at: &Loc) -> Result<Vec<Use>> {
     let Yaml::Array(entries) = yaml else {
-        return err(at, "expected a list of { path, rights }");
+        return err(ErrorKind::Shape, at, "expected a list of { path, rights }");
     };
     entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let at = format!("{at}[{i}]");
+            let at = at.index(i);
             let mut entry = Map::of(entry, &at)?;
-            let path = path(entry.require("path")?, &format!("{at}.path"))?;
-            let rights_at = format!("{at}.rights");
+            let path = path(entry.require("path")?, &at.field("path"))?;
+            let rights_at = at.field("rights");
             let names: Vec<&str> = match entry.require("rights")? {
                 Yaml::String(s) => s.split('+').map(str::trim).collect(),
                 Yaml::Array(items) => items.iter().map(|y| y.as_str().unwrap_or("")).collect(),
-                _ => return err(rights_at, "expected rights such as [read, write] or `read+write`"),
+                _ => return err(ErrorKind::Shape, &rights_at, "expected rights such as [read, write] or `read+write`"),
             };
             entry.finish()?;
             let rights = names.iter().try_fold(Rights::NONE, |acc, name| match Rights::from_name(name) {
                 Some(r) => Ok(acc | r),
-                None => err(&rights_at, format!("unknown right `{name}`")),
+                None => err(ErrorKind::UnknownRight, &rights_at, format!("unknown right `{name}`")),
             })?;
             Ok(Use { path, rights })
         })
@@ -115,23 +166,24 @@ impl Compiler {
         false
     }
 
-    fn step(&mut self, step: &Yaml, at: &str) -> Result<()> {
+    fn step(&mut self, step: &Yaml, at: &Loc) -> Result<()> {
         let mut step_map = Map::of(step, at)?;
-        let label = step_map.optional("id").map(|y| text(y, &format!("{at}.id"))).transpose()?;
+        let label = step_map.optional("id").map(|y| text(y, &at.field("id"))).transpose()?;
         let after = step_map.optional("after");
         let [(op_name, body)] = step_map.entries.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()[..] else {
-            return err(at, "a step has exactly one operation (plus optional `id` and `after`)");
+            return err(ErrorKind::Shape, at, "a step has exactly one operation (plus optional `id` and `after`)");
         };
         let id = NodeId(self.nodes.len() as u32);
         let previous = self.nodes.last().map(|n| n.id);
+        let after_at = at.field("after");
         let after = match after {
             None => Vec::new(),
             Some(Yaml::Array(items)) => {
-                items.iter().map(|y| self.reference(y, &format!("{at}.after"), previous)).collect::<Result<Vec<_>>>()?
+                items.iter().map(|y| self.reference(y, &after_at, previous)).collect::<Result<Vec<_>>>()?
             }
-            Some(y) => vec![self.reference(y, &format!("{at}.after"), previous)?],
+            Some(y) => vec![self.reference(y, &after_at, previous)?],
         };
-        let at = format!("{at}.{op_name}");
+        let at = at.keyword(op_name, OPERATIONS);
 
         let (op, data_sources) = if op_name == "compose" {
             let expr = self.expr(body, &at, previous)?;
@@ -143,7 +195,8 @@ impl Compiler {
 
         for (path, needed) in op.footprint() {
             if !self.declared(path).contains(needed) {
-                return err(&at, format!("{path} needs `{needed}`, which is not declared in `authority`"));
+                let detail = format!("{path} needs `{needed}`, which is not declared in `authority`");
+                return err(ErrorKind::Undeclared, &at, detail);
             }
         }
         for from in data_sources {
@@ -151,7 +204,7 @@ impl Compiler {
         }
         if let Some(label) = &label {
             if self.labels.insert(label.clone(), id).is_some() {
-                return err(at, format!("duplicate id `{label}`"));
+                return err(ErrorKind::DuplicateId, &at, format!("duplicate id `{label}`"));
             }
         }
         self.nodes.push(Node { id, label, op });
@@ -177,15 +230,17 @@ impl Compiler {
     }
 
     /// A read, write or invoke step: the op and its data source, if any.
-    fn operation(&self, op_name: &str, body: &Yaml, at: &str, previous: Option<NodeId>) -> Result<(Op, Vec<NodeId>)> {
-        let at = at.to_owned();
+    fn operation(&self, op_name: &str, body: &Yaml, at: &Loc, previous: Option<NodeId>) -> Result<(Op, Vec<NodeId>)> {
+        if !matches!(op_name, "read" | "write" | "invoke") {
+            return err(ErrorKind::UnknownOperation, at, format!("unknown operation `{op_name}`"));
+        }
         // Short form `op: /path` takes its data from the previous step.
         let (target, literal, from, uses) = match body {
-            Yaml::String(_) => (path(body, &at)?, None, previous, Vec::new()),
+            Yaml::String(_) => (path(body, at)?, None, previous, Vec::new()),
             _ => {
-                let mut body = Map::of(body, &at)?;
-                let target = path(body.require("path")?, &format!("{at}.path"))?;
-                let literal_key = match op_name {
+                let mut body = Map::of(body, at)?;
+                let target = path(body.require("path")?, &at.field("path"))?;
+                let literal_key: Option<&'static str> = match op_name {
                     "write" => Some("value"),
                     "invoke" => Some("input"),
                     _ => None,
@@ -201,18 +256,20 @@ impl Compiler {
                     }
                 }
                 let uses = match body.optional("uses") {
-                    Some(y) if op_name == "invoke" => compile_uses(y, &format!("{at}.uses"))?,
-                    Some(_) => return err(at, "only `invoke` takes `uses`"),
+                    Some(y) if op_name == "invoke" => compile_uses(y, &at.field("uses"))?,
+                    Some(_) => return err(ErrorKind::UnknownKey, &at.field("uses"), "only `invoke` takes `uses`"),
                     None => Vec::new(),
                 };
                 body.finish()?;
                 let from = match (literal, from) {
-                    (Some((k, _)), Some(_)) => return err(at, format!("give either `{k}` or `from`, not both")),
+                    (Some((k, _)), Some(_)) => {
+                        return err(ErrorKind::ConflictingData, at, format!("give either `{k}` or `from`, not both"))
+                    }
                     (Some(_), None) => None,
-                    (None, Some(from)) => Some(self.reference(from, &format!("{at}.from"), previous)?),
+                    (None, Some(from)) => Some(self.reference(from, &at.field("from"), previous)?),
                     (None, None) => previous,
                 };
-                let literal = literal.map(|(k, y)| value(y, &format!("{at}.{k}"))).transpose()?;
+                let literal = literal.map(|(k, y)| value(y, &at.field(k))).transpose()?;
                 (target, literal, from, uses)
             }
         };
@@ -220,13 +277,12 @@ impl Compiler {
         let op = match op_name {
             "read" => Op::Read(ReadOp { target }),
             "invoke" => Op::Invoke(InvokeOp { target, input: literal, uses }),
-            "write" => {
+            _ => {
                 if literal.is_none() && from.is_none() {
-                    return err(at, "nothing to write: give `value` or `from`");
+                    return err(ErrorKind::MissingData, at, "nothing to write: give `value` or `from`");
                 }
                 Op::Write(WriteOp { target, value: literal })
             }
-            other => return err(at, format!("unknown operation `{other}`")),
         };
         // Reads take no input; literals need none.
         let data = match (from, &op) {
@@ -238,17 +294,18 @@ impl Compiler {
     }
 
     /// One composition expression: a map with exactly one constructor key.
-    fn expr(&self, yaml: &Yaml, at: &str, previous: Option<NodeId>) -> Result<ValueExpr> {
+    fn expr(&self, yaml: &Yaml, at: &Loc, previous: Option<NodeId>) -> Result<ValueExpr> {
         let map = Map::of(yaml, at)?;
         let [(constructor, body)] = map.entries.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()[..] else {
-            return err(at, "an expression has exactly one of `literal`, `select`, `map`, `list`");
+            return err(ErrorKind::Shape, at, "an expression has exactly one of `literal`, `select`, `map`, `list`");
         };
-        let at = format!("{at}.{constructor}");
+        let at = at.keyword(constructor, CONSTRUCTORS);
         match constructor {
             "literal" => Ok(ValueExpr::Literal(value(body, &at)?)),
             "select" => {
                 let mut select = Map::of(body, &at)?;
-                let source = self.reference(select.require("from")?, &format!("{at}.from"), previous)?;
+                let source = self.reference(select.require("from")?, &at.field("from"), previous)?;
+                let path_at = at.field("path");
                 let path = match select.optional("path") {
                     None => Vec::new(),
                     Some(Yaml::Array(items)) => items
@@ -257,10 +314,14 @@ impl Compiler {
                         .map(|(i, item)| match item {
                             Yaml::String(k) => Ok(Selector::Key(k.clone())),
                             Yaml::Integer(n) if *n >= 0 => Ok(Selector::Index(*n as usize)),
-                            _ => err(format!("{at}.path[{i}]"), "expected a key (text) or index (non-negative int)"),
+                            _ => err(
+                                ErrorKind::InvalidValue,
+                                &path_at.index(i),
+                                "expected a key (text) or index (non-negative int)",
+                            ),
                         })
                         .collect::<Result<_>>()?,
-                    Some(_) => return err(format!("{at}.path"), "expected a list of keys and indexes"),
+                    Some(_) => return err(ErrorKind::Shape, &path_at, "expected a list of keys and indexes"),
                 };
                 select.finish()?;
                 Ok(ValueExpr::Select { source, path })
@@ -270,7 +331,7 @@ impl Compiler {
                 let fields = fields
                     .entries
                     .iter()
-                    .map(|(k, v)| Ok(((*k).to_owned(), self.expr(v, &format!("{at}.{k}"), previous)?)))
+                    .map(|(k, v)| Ok(((*k).to_owned(), self.expr(v, &at.name(k), previous)?)))
                     .collect::<Result<_>>()?;
                 Ok(ValueExpr::Map(fields))
             }
@@ -279,31 +340,31 @@ impl Compiler {
                     items
                         .iter()
                         .enumerate()
-                        .map(|(i, item)| self.expr(item, &format!("{at}[{i}]"), previous))
+                        .map(|(i, item)| self.expr(item, &at.index(i), previous))
                         .collect::<Result<_>>()?,
                 )),
-                _ => err(at, "expected a list of expressions"),
+                _ => err(ErrorKind::Shape, &at, "expected a list of expressions"),
             },
-            other => err(at, format!("unknown constructor `{other}`")),
+            other => err(ErrorKind::UnknownConstructor, &at, format!("unknown constructor `{other}`")),
         }
     }
 
-    fn reference(&self, from: &Yaml, at: &str, previous: Option<NodeId>) -> Result<NodeId> {
+    fn reference(&self, from: &Yaml, at: &Loc, previous: Option<NodeId>) -> Result<NodeId> {
         match text(from, at)?.as_str() {
-            "previous" => previous.ok_or(()).or_else(|_| err(at, "no previous step")),
+            "previous" => previous.ok_or(()).or_else(|_| err(ErrorKind::UnknownReference, at, "no previous step")),
             label => match self.labels.get(label) {
                 Some(&id) => Ok(id),
-                None => err(at, format!("no earlier step with id `{label}`")),
+                None => err(ErrorKind::UnknownReference, at, format!("no earlier step with id `{label}`")),
             },
         }
     }
 
-    fn outputs(&self, yaml: &Yaml) -> Result<Vec<GraphOutput>> {
-        let map = Map::of(yaml, "outputs")?;
+    fn outputs(&self, yaml: &Yaml, at: &Loc) -> Result<Vec<GraphOutput>> {
+        let map = Map::of(yaml, at)?;
         map.entries
             .iter()
             .map(|(name, spec)| {
-                let at = format!("outputs.{name}");
+                let at = at.name(name);
                 let source = match spec {
                     Yaml::Hash(_) => {
                         let mut spec = Map::of(spec, &at)?;
@@ -313,7 +374,7 @@ impl Compiler {
                     }
                     other => other,
                 };
-                let source = self.reference(source, &format!("{at}.from"), None)?;
+                let source = self.reference(source, &at.field("from"), None)?;
                 Ok(GraphOutput { name: (*name).to_owned(), source })
             })
             .collect()
@@ -322,73 +383,78 @@ impl Compiler {
 
 /// A YAML map whose keys must all be consumed.
 struct Map<'y> {
-    at: String,
+    at: Loc,
     entries: BTreeMap<&'y str, &'y Yaml>,
 }
 
 impl<'y> Map<'y> {
-    fn of(yaml: &'y Yaml, at: &str) -> Result<Self> {
+    fn of(yaml: &'y Yaml, at: &Loc) -> Result<Self> {
         let Yaml::Hash(hash) = yaml else {
-            return err(at, "expected a map");
+            return err(ErrorKind::Shape, at, "expected a map");
         };
         let mut entries = BTreeMap::new();
         for (k, v) in hash {
             match k.as_str() {
                 Some(k) => entries.insert(k, v),
-                None => return err(at, "map keys must be strings"),
+                None => return err(ErrorKind::Shape, at, "map keys must be strings"),
             };
         }
-        Ok(Map { at: at.to_owned(), entries })
+        Ok(Map { at: at.clone(), entries })
     }
 
     fn optional(&mut self, key: &str) -> Option<&'y Yaml> {
         self.entries.remove(key)
     }
 
-    fn require(&mut self, key: &str) -> Result<&'y Yaml> {
+    /// `key` is always a grammar label, so it may appear in the location.
+    fn require(&mut self, key: &'static str) -> Result<&'y Yaml> {
         match self.entries.remove(key) {
             Some(v) => Ok(v),
-            None => err(&self.at, format!("missing `{key}`")),
+            None => err(ErrorKind::MissingKey, &self.at.field(key), format!("missing `{key}`")),
         }
     }
 
     fn finish(self) -> Result<()> {
         match self.entries.keys().next() {
             None => Ok(()),
-            Some(key) => err(self.at, format!("unknown key `{key}`")),
+            Some(key) => err(ErrorKind::UnknownKey, &self.at.name(key), format!("unknown key `{key}`")),
         }
     }
 }
 
-fn text(yaml: &Yaml, at: &str) -> Result<String> {
+fn text(yaml: &Yaml, at: &Loc) -> Result<String> {
     match yaml {
         Yaml::String(s) => Ok(s.clone()),
-        _ => err(at, "expected text"),
+        _ => err(ErrorKind::Shape, at, "expected text"),
     }
 }
 
-fn path(yaml: &Yaml, at: &str) -> Result<Path> {
-    Path::parse(&text(yaml, at)?).or_else(|e| err(at, e.to_string()))
+fn path(yaml: &Yaml, at: &Loc) -> Result<Path> {
+    Path::parse(&text(yaml, at)?).or_else(|e| err(ErrorKind::InvalidPath, at, e.to_string()))
 }
 
-fn value(yaml: &Yaml, at: &str) -> Result<Value> {
+fn value(yaml: &Yaml, at: &Loc) -> Result<Value> {
     Ok(match yaml {
         Yaml::Null => Value::Null,
         Yaml::Boolean(b) => Value::Bool(*b),
         Yaml::Integer(i) => Value::Int(*i),
-        Yaml::Real(r) => Value::Float(r.parse().or_else(|_| err(at, format!("bad float `{r}`")))?),
+        Yaml::Real(r) => {
+            Value::Float(r.parse().or_else(|_| err(ErrorKind::InvalidValue, at, format!("bad float `{r}`")))?)
+        }
         Yaml::String(s) => Value::Text(s.clone()),
-        Yaml::Array(items) => Value::List(items.iter().map(|y| value(y, at)).collect::<Result<_>>()?),
+        Yaml::Array(items) => {
+            Value::List(items.iter().enumerate().map(|(i, y)| value(y, &at.index(i))).collect::<Result<_>>()?)
+        }
         Yaml::Hash(_) => {
             let map = Map::of(yaml, at)?;
             Value::Map(
                 map.entries
                     .iter()
-                    .map(|(k, v)| Ok(((*k).to_owned(), value(v, &format!("{at}.{k}"))?)))
+                    .map(|(k, v)| Ok(((*k).to_owned(), value(v, &at.name(k))?)))
                     .collect::<Result<_>>()?,
             )
         }
-        _ => return err(at, "unsupported yaml value"),
+        _ => return err(ErrorKind::InvalidValue, at, "unsupported yaml value"),
     })
 }
 
@@ -513,7 +579,7 @@ flow:
             (ECHO.replace("from: make_meat", "from: make_meat\n      value: 1"), "flow[1].write"),
             (ECHO.replace("    write:", "    exec:"), "flow[1].exec"),
             (ECHO.replace("path: /tools/echo\n      input", "path: /tools/../etc\n      input"), "flow[0].invoke.path"),
-            (ECHO.replace("  name: echoer", "  name: echoer\n  shell: bash"), "agent"),
+            (ECHO.replace("  name: echoer", "  name: echoer\n  shell: bash"), "agent.shell"),
             (ECHO.replace("[invoke]", "[root]"), "authority[0].rights"),
             (ECHO.replace("- id: store", "- id: make_meat"), "flow[1].write"),
             (ECHO.replace("  - id: store\n", "  - id: store\n    read: /x\n"), "flow[1]"),
@@ -594,5 +660,32 @@ flow:
         for (src, at) in cases {
             assert_eq!(compile(&src).unwrap_err().at, at, "{src}");
         }
+    }
+
+    #[test]
+    fn errors_have_stable_kinds_and_content_free_renderings() {
+        const SECRET: &str = "zq-secret-5150";
+        let cases = [
+            (format!("agent: {{ name: a }}\nflow: [ {{ read: /x }}\n  {SECRET}: ]"), ErrorKind::Syntax),
+            (format!("agent: {{ name: a }}\n{SECRET}: 1\nflow: [ {{ read: /x }} ]"), ErrorKind::UnknownKey),
+            (format!("agent: {{ name: a }}\nflow: [ {{ {SECRET}: /x }} ]"), ErrorKind::UnknownOperation),
+            (format!("agent: {{ name: a }}\nflow: [ {{ read: /a/../{SECRET} }} ]"), ErrorKind::InvalidPath),
+            (format!("agent: {{ name: a }}\nauthority: [{{ path: /x, rights: [{SECRET}] }}]\nflow: [ {{ read: /x }} ]"), ErrorKind::UnknownRight),
+            (format!("agent: {{ name: a }}\nflow: [ {{ read: /{SECRET} }} ]"), ErrorKind::Undeclared),
+            (format!("agent: {{ name: a }}\nflow: [ {{ compose: {{ map: {{ {SECRET}: {{ quote: 1 }} }} }} }} ]"), ErrorKind::UnknownConstructor),
+            (format!("agent: {{ name: a }}\nflow: [ {{ compose: {{ select: {{ from: {SECRET} }} }} }} ]"), ErrorKind::UnknownReference),
+            (format!("agent: {{ name: a }}\nflow: [ {{ compose: {{ literal: 1 }} }} ]\noutputs: {{ {SECRET}: ghost }}"), ErrorKind::UnknownReference),
+            (format!("agent: {{ name: a }}\nflow:\n  - {{ id: x, compose: {{ literal: 1 }} }}\n  - {{ compose: {{ map: {{ {SECRET}: {{ select: {{ from: x, path: [-1] }} }} }} }} }}"), ErrorKind::InvalidValue),
+        ];
+        for (src, kind) in cases {
+            let e = compile(&src).unwrap_err();
+            assert_eq!(e.kind, kind, "{src}");
+            let redacted = e.render(false);
+            assert!(!redacted.contains(SECRET) && !e.at_redacted.contains(SECRET), "{redacted}");
+            let revealing = !matches!(kind, ErrorKind::Syntax | ErrorKind::InvalidValue);
+            assert!(e.render(true).contains(SECRET) || !revealing, "{}", e.render(true));
+        }
+        let syntax = compile(&format!("agent: {{ name: a }}\nflow: [ {{ read: /x }}\n  {SECRET}: ]")).unwrap_err();
+        assert!(syntax.position.is_some());
     }
 }

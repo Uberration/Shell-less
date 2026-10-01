@@ -42,8 +42,53 @@ pub enum Error {
         object: ObjectId,
         message: String,
     },
+    /// A capability's declaration differs from the one pinned by its caller.
+    DeclarationChanged(ObjectId),
     /// A transaction's precondition no longer holds.
     Conflict(ObjectId),
+}
+
+impl Error {
+    /// The variant name, for structured reporting.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::InvalidPath(_) => "InvalidPath",
+            Error::Unbound(_) => "Unbound",
+            Error::AlreadyBound(_) => "AlreadyBound",
+            Error::UnknownObject(_) => "UnknownObject",
+            Error::Unsupported { .. } => "Unsupported",
+            Error::Denied { .. } => "Denied",
+            Error::InvalidGrant(_) => "InvalidGrant",
+            Error::PolicyDenied { .. } => "PolicyDenied",
+            Error::NotAttached(_) => "NotAttached",
+            Error::Impure(_) => "Impure",
+            Error::InvalidInput { .. } => "InvalidInput",
+            Error::Capability { .. } => "Capability",
+            Error::DeclarationChanged(_) => "DeclarationChanged",
+            Error::Conflict(_) => "Conflict",
+        }
+    }
+
+    /// A rendering without paths or capability messages: the kind plus
+    /// opaque identities and rights only.
+    pub fn redacted(&self) -> String {
+        let kind = self.kind();
+        match self {
+            Error::UnknownObject(o) | Error::Impure(o) | Error::DeclarationChanged(o) | Error::Conflict(o) => {
+                format!("{kind} object={o}")
+            }
+            Error::Unsupported { object, op } => format!("{kind} object={object} op={op}"),
+            Error::Denied { object, needed } => format!("{kind} object={object} needs={needed}"),
+            Error::InvalidInput { object, .. } | Error::Capability { object, .. } => {
+                format!("{kind} object={object} detail=<omitted>")
+            }
+            Error::InvalidGrant(g) => format!("{kind} grant={g}"),
+            Error::PolicyDenied { rights, .. } => format!("{kind} path=<omitted> rights={rights}"),
+            Error::InvalidPath(_) | Error::Unbound(_) | Error::AlreadyBound(_) | Error::NotAttached(_) => {
+                format!("{kind} path=<omitted>")
+            }
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -61,6 +106,7 @@ impl fmt::Display for Error {
             Error::Impure(o) => write!(f, "{o}: pure capability attempted an effect"),
             Error::InvalidInput { object, message } => write!(f, "{object}: invalid input: {message}"),
             Error::Capability { object, message } => write!(f, "{object}: {message}"),
+            Error::DeclarationChanged(o) => write!(f, "{o}: declaration changed since it was pinned"),
             Error::Conflict(o) => write!(f, "{o}: changed during transaction"),
         }
     }

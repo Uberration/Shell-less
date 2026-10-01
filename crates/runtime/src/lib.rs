@@ -90,24 +90,36 @@ impl ContentCapture {
 }
 
 /// Why a program could not be loaded. Nothing has executed and the
-/// namespace is unchanged.
+/// namespace is unchanged. Only `Authority` can carry source text (paths,
+/// capability messages); [`LoadError::render`] omits it unless revealed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadError {
     /// The IR violates a structural rule.
-    InvalidGraph(String),
+    InvalidGraph { node: Option<NodeId>, reason: &'static str },
     /// A composition exceeds host limits.
-    LimitExceeded(String),
+    LimitExceeded { node: NodeId },
     /// Authority resolution failed: policy denial, unbound name, …
     Authority(meatfs::Error),
 }
 
+impl LoadError {
+    /// Render for a diagnostic surface: with source text only if `reveal`.
+    pub fn render(&self, reveal: bool) -> String {
+        match self {
+            LoadError::InvalidGraph { node: Some(node), reason } => {
+                format!("load error InvalidGraph node={node}: {reason}")
+            }
+            LoadError::InvalidGraph { node: None, reason } => format!("load error InvalidGraph: {reason}"),
+            LoadError::LimitExceeded { node } => format!("load error LimitExceeded node={node}"),
+            LoadError::Authority(e) if reveal => format!("load error Authority: {e}"),
+            LoadError::Authority(e) => format!("load error Authority: {}", e.redacted()),
+        }
+    }
+}
+
 impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LoadError::InvalidGraph(m) => write!(f, "invalid graph: {m}"),
-            LoadError::LimitExceeded(m) => write!(f, "limit exceeded: {m}"),
-            LoadError::Authority(e) => write!(f, "authority: {e}"),
-        }
+        f.write_str(&self.render(true))
     }
 }
 
@@ -132,6 +144,9 @@ pub struct ResolvedNode {
     pub grant: Option<GrantId>,
     /// Grants attached to an invocation: all its capability may use.
     pub uses: Vec<NodeGrant>,
+    /// For invocations: the capability's declaration as read at load. The
+    /// loader schedules by it and execution requires it to be unchanged.
+    pub declared: Option<CapabilityMeta>,
 }
 
 /// A resolved execution graph: IR, issued authority, per-node projection.
@@ -179,11 +194,11 @@ type Adjacency = (Vec<Vec<usize>>, Vec<Vec<usize>>);
 /// data inputs are exactly the distinct sources it selects from; outputs
 /// name existing nodes; the graph is acyclic.
 fn validate(graph: &Graph) -> Result<Adjacency, LoadError> {
-    let invalid = |m: String| Err(LoadError::InvalidGraph(m));
+    let invalid = |node: Option<NodeId>, reason: &'static str| Err(LoadError::InvalidGraph { node, reason });
     let n = graph.nodes.len();
     for (i, node) in graph.nodes.iter().enumerate() {
         if node.id != NodeId(i as u32) {
-            return invalid(format!("node at index {i} has id {}", node.id));
+            return invalid(Some(NodeId(i as u32)), "node id does not match its index");
         }
     }
     let mut preds = vec![Vec::new(); n];
@@ -192,7 +207,7 @@ fn validate(graph: &Graph) -> Result<Adjacency, LoadError> {
     for edge in &graph.edges {
         let (from, to) = (edge.from.0 as usize, edge.to.0 as usize);
         if from >= n || to >= n {
-            return invalid(format!("edge {} → {} leaves the graph", edge.from, edge.to));
+            return invalid(Some(edge.to), "edge endpoint outside the graph");
         }
         if edge.kind == EdgeKind::Data {
             data_in[to].push(edge.from);
@@ -205,25 +220,25 @@ fn validate(graph: &Graph) -> Result<Adjacency, LoadError> {
         match &node.op {
             Op::Compose(expr) => {
                 if *inputs != expr.sources() {
-                    return invalid(format!("{}: data inputs do not match the sources it selects", node.id));
+                    return invalid(Some(node.id), "data inputs do not match the sources it selects");
                 }
             }
-            _ if inputs.len() > 1 => return invalid(format!("{} has more than one data input", node.id)),
-            Op::Read(_) if !inputs.is_empty() => return invalid(format!("{} reads but has a data input", node.id)),
+            _ if inputs.len() > 1 => return invalid(Some(node.id), "more than one data input"),
+            Op::Read(_) if !inputs.is_empty() => return invalid(Some(node.id), "read with a data input"),
             op if op.literal().is_some() && !inputs.is_empty() => {
-                return invalid(format!("{} has both literal data and a data input", node.id))
+                return invalid(Some(node.id), "both literal data and a data input")
             }
             Op::Write(w) if w.value.is_none() && inputs.is_empty() => {
-                return invalid(format!("{} writes nothing", node.id))
+                return invalid(Some(node.id), "write without data")
             }
             _ => {}
         }
     }
     if let Some(o) = graph.outputs.iter().find(|o| o.source.0 as usize >= n) {
-        return invalid(format!("output `{}` names missing node {}", o.name, o.source));
+        return invalid(Some(o.source), "output names a missing node");
     }
     if topological(&preds, &succs).len() != n {
-        return invalid("graph has a cycle".to_owned());
+        return invalid(None, "graph has a cycle");
     }
     Ok((preds, succs))
 }
@@ -268,7 +283,7 @@ pub fn load(fs: &MeatFs, policy: &Policy, limits: Limits, program: &Program) -> 
     for node in &program.graph.nodes {
         if let Op::Compose(expr) = &node.op {
             if expr.depth() > limits.max_depth || expr.count() > limits.max_exprs {
-                return Err(LoadError::LimitExceeded(format!("{}: composition too deep or too large", node.id)));
+                return Err(LoadError::LimitExceeded { node: node.id });
             }
         }
     }
@@ -296,23 +311,31 @@ pub fn load(fs: &MeatFs, policy: &Policy, limits: Limits, program: &Program) -> 
             .iter()
             .map(|u| NodeGrant { path: u.path.clone(), grant: issued.next().expect("one grant per want").id() })
             .collect();
-        if let (Op::Invoke(_), ResolvedTarget::Object(o), false) = (&node.op, &target, uses.is_empty()) {
-            if fs.meta(*o).is_some_and(|m| m.purity == Purity::Pure) {
-                return Err(LoadError::InvalidGraph(format!("{}: pure capability cannot be given `uses`", node.id)));
+        let declared = match (&node.op, &target) {
+            (Op::Invoke(_), ResolvedTarget::Object(o)) => fs.meta(*o),
+            _ => None,
+        };
+        if let (Some(meta), false) = (&declared, uses.is_empty()) {
+            if meta.purity == Purity::Pure {
+                return Err(LoadError::InvalidGraph {
+                    node: Some(node.id),
+                    reason: "pure capability cannot be given `uses`",
+                });
             }
         }
-        nodes.push(ResolvedNode { id: node.id, target, grant, uses });
+        nodes.push(ResolvedNode { id: node.id, target, grant, uses, declared });
     }
     drop(issued);
 
     // Effects outside MeatFS are invisible to footprints, so invocations not
-    // declared pure are ordered among themselves, along a topological order
-    // of the IR (which keeps the graph acyclic).
+    // declared pure — including those whose purity is unknown — are chained
+    // along one deterministic topological order of the source graph. Every
+    // added edge points forward in that order, so none can form a cycle.
     let effectful: Vec<usize> = topological(&preds, &succs)
         .into_iter()
-        .filter(|&i| match (&program.graph.nodes[i].op, &nodes[i].target) {
-            (Op::Invoke(_), ResolvedTarget::Object(o)) => fs.meta(*o).is_none_or(|m| m.purity != Purity::Pure),
-            _ => false,
+        .filter(|&i| {
+            matches!(program.graph.nodes[i].op, Op::Invoke(_))
+                && nodes[i].declared.as_ref().is_none_or(|m| m.purity != Purity::Pure)
         })
         .collect();
     let mut derived = Vec::new();
@@ -355,6 +378,8 @@ pub enum ExecutionErrorKind {
     IndexOutOfRange,
     /// A composition exceeded a host limit.
     LimitExceeded,
+    /// An invoked capability no longer declares what it declared at load.
+    DeclarationChanged,
 }
 
 /// A structured failure: what failed, where, with which authority.
@@ -396,6 +421,7 @@ fn classify(e: &meatfs::Error) -> (ExecutionErrorKind, Option<ObjectId>) {
         E::InvalidPath(_) => (K::InvalidInput, None),
         E::InvalidInput { object, .. } => (K::InvalidInput, Some(*object)),
         E::Capability { object, .. } | E::Impure(object) => (K::CapabilityFailed, Some(*object)),
+        E::DeclarationChanged(o) => (K::DeclarationChanged, Some(*o)),
         E::Conflict(o) => (K::TransactionConflict, Some(*o)),
     }
 }
@@ -528,7 +554,7 @@ impl Run<'_> {
             (Op::Read(_), ResolvedTarget::Object(o)) => self.tx.read(&access, *o).map(|v| (Some(*o), v)),
             (Op::Invoke(_), ResolvedTarget::Object(o)) => {
                 let attached = NodeGrants::new(grants, &resolved.uses).expect("uses are in the set");
-                self.tx.invoke(&access, *o, input, attached).map(|v| (Some(*o), v))
+                self.tx.invoke(&access, *o, input, attached, resolved.declared.as_ref()).map(|v| (Some(*o), v))
             }
             (Op::Write(_), ResolvedTarget::Object(o)) => {
                 self.tx.write(&access, *o, input.clone()).map(|_| (Some(*o), input))
@@ -590,6 +616,17 @@ impl Run<'_> {
 /// succeeds, otherwise discard staged changes. Always produces a receipt,
 /// retaining payloads only as `capture` allows.
 pub fn execute(fs: &MeatFs, loaded: &Loaded, capture: ContentCapture) -> ExecutionOutcome {
+    execute_with(fs, loaded, capture, &mut || {})
+}
+
+/// [`execute`], calling `before_commit` immediately before the real commit
+/// is attempted. Lets the test harness act as a second writer.
+pub(crate) fn execute_with(
+    fs: &MeatFs,
+    loaded: &Loaded,
+    capture: ContentCapture,
+    before_commit: &mut dyn FnMut(),
+) -> ExecutionOutcome {
     let execution = fs.new_execution();
     let n = loaded.graph.nodes.len();
     let mut run = Run {
@@ -657,15 +694,18 @@ pub fn execute(fs: &MeatFs, loaded: &Loaded, capture: ContentCapture) -> Executi
             TxOutcome::RolledBack
         }
         // Never retried: the graph may already have invoked effectful work.
-        None => match tx.commit() {
-            Ok(()) => TxOutcome::Committed,
-            Err(e) => {
-                let (kind, object) = classify(&e);
-                let detail = capture.text(e.to_string());
-                error = Some(ExecutionError { execution, node: None, object, grant: None, kind, detail });
-                TxOutcome::RolledBack
+        None => {
+            before_commit();
+            match tx.commit() {
+                Ok(()) => TxOutcome::Committed,
+                Err(e) => {
+                    let (kind, object) = classify(&e);
+                    let detail = capture.text(e.to_string());
+                    error = Some(ExecutionError { execution, node: None, object, grant: None, kind, detail });
+                    TxOutcome::RolledBack
+                }
             }
-        },
+        }
     };
 
     let events = loaded
@@ -696,10 +736,7 @@ pub fn execute(fs: &MeatFs, loaded: &Loaded, capture: ContentCapture) -> Executi
                 object: objects[i],
                 grant: resolved.grant,
                 uses: resolved.uses.iter().map(|u| u.grant).collect(),
-                declared: match (&node.op, &resolved.target) {
-                    (Op::Invoke(_), ResolvedTarget::Object(o)) => fs.meta(*o),
-                    _ => None,
-                },
+                declared: resolved.declared.clone(),
                 input: inputs[i].as_ref().map(|v| capture.value(v)),
                 output: outputs[i].as_ref().map(|v| capture.value(v)),
                 staged: match (staged_by.contains(&node.id), transaction) {

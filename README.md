@@ -57,6 +57,12 @@ cargo run -p shell-less -- check examples/escalate.meat.yaml            # reject
 cargo run -p shell-less -- run examples/escalate-declared.meat.yaml     # rejected by host policy at load
 ```
 
+### Validation
+
+```sh
+./scripts/validate.sh   # fmt --check, clippy -D warnings, tests, locked build; stops at the first failure
+```
+
 ### Semantics
 
 - **Ordering.** Only edges order execution. `NodeId` breaks ties among ready nodes for reproducibility and carries no meaning.
@@ -66,7 +72,8 @@ cargo run -p shell-less -- run examples/escalate-declared.meat.yaml     # reject
 - **Determinism.** The same graph, seed and initial state give an identical receipt.
 - **Capability properties.** `Purity` (may it touch state?) and `Determinism` (same inputs, same output?) are independent. `InvocationMeta { implementation, revision }` records which implementation produced a result, and receipts record it for every invocation.
 - **Composition.** `compose` builds a value from `literal`, `select` (key/index path into an earlier output), `map` and `list`. Each expression has exactly one constructor. It holds no grants, reads no state, and has no interpolation or evaluation. Every selected source is a data edge. Missing keys, wrong kinds, out-of-range indexes and host limit breaches are structured failures.
-- **Content capture.** The host chooses `ContentCapture::Omit` (the default) or `Inline`. Receipts, journals, error details and CLI diagnostics carry no payloads under `Omit`. Real results go to the caller through `ExecutionOutcome.outputs` (CLI: `--show-outputs`). Programs and capabilities cannot raise capture.
-- **Atomicity boundary.** Only MeatFS state is transactional. Effects outside MeatFS are not undone. A completed invocation stays `Succeeded`, and its node's `staged` field reports whether its MeatFS changes were kept. Commit conflicts are reported, never retried. Invocations not declared pure are chained at load in a deterministic topological order (`derived_order` in the receipt), because their outside effects are invisible to footprints.
+- **Content capture.** The host chooses `ContentCapture::Omit` (the default) or `Inline` before a program is parsed. Under `Omit`, managed diagnostic surfaces carry no source text and no payloads. Those surfaces are compile errors, load errors, receipts, execution error details, and the CLI's IR, receipt and namespace dumps. Source text includes names, paths, map and selector keys, labels and literals. What remains is error kinds, structural locations (with line and column where the YAML parser reports them), opaque identities, structure and outcomes. That is a promise about text, not a claim that structure, identities or outcomes reveal nothing. Real results go to the caller through `ExecutionOutcome.outputs` (CLI: `--show-outputs`, which opens only the result channel). Programs and capabilities cannot raise capture.
+- **Atomicity boundary.** Only MeatFS state is transactional. Effects outside MeatFS are not undone. A completed invocation stays `Succeeded`, and its node's `staged` field reports whether its MeatFS changes were kept. A commit conflict fails the whole execution (`TransactionConflict`, no node, no outputs), even if every node finished. A competing writer's commit is preserved, and nothing is retried.
+- **Resolved execution plan.** The plan is the source IR, plus the capability declarations read at load, plus loader-derived ordering. Invocations not declared pure, including those of unknown purity, are chained along one deterministic topological order of the source graph (`derived_order` in the receipt). Every added edge points forward, so none can create a cycle. Declarations are pinned at load: if a capability declares something else at execution time, the call is refused (`DeclarationChanged`) before it runs. `GraphId` identifies the source IR only.
 - **Declared ≠ verified.** Purity, determinism and implementation identity are recorded as `declared`. Nothing yet verifies them, and they authorize no caching, retries or speculative parallelism. Compiled-in capabilities are trusted host code; grants bound their MeatFS access, not arbitrary Rust.
 - **Models are capabilities.** A model is mounted at a path like `/models/<name>/infer` and invoked like anything else. Inference is declared `Effectful`, even for the deterministic mock, because real inference depends on weights, samplers, hardware and caches.

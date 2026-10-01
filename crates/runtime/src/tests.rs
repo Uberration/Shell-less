@@ -232,7 +232,7 @@ flow:
   - invoke: { path: /tools/echo, input: { text: x }, uses: [{ path: /state/a, rights: [write] }] }
 "#,
     );
-    assert!(matches!(e, Err(LoadError::InvalidGraph(_))));
+    assert!(matches!(e, Err(LoadError::InvalidGraph { .. })));
 }
 
 #[test]
@@ -250,11 +250,11 @@ fn rejects_structurally_invalid_ir() {
     let program = meatyaml::compile(ECHO).unwrap();
     let mut cyclic = program.graph.clone();
     cyclic.edges.push(Edge { from: NodeId(1), to: NodeId(0), kind: EdgeKind::Order });
-    assert!(matches!(validate(&cyclic), Err(LoadError::InvalidGraph(_))));
+    assert!(matches!(validate(&cyclic), Err(LoadError::InvalidGraph { .. })));
 
     let mut double_input = program.graph.clone();
     double_input.edges.push(Edge { from: NodeId(0), to: NodeId(1), kind: EdgeKind::Data });
-    assert!(matches!(validate(&double_input), Err(LoadError::InvalidGraph(_))));
+    assert!(matches!(validate(&double_input), Err(LoadError::InvalidGraph { .. })));
 }
 
 #[test]
@@ -462,9 +462,9 @@ fn composition_is_bounded_by_host_limits() {
     let (fs, _) = boot(1);
     let program = meatyaml::compile(COMPOSER).unwrap();
     let shallow = Limits { max_depth: 2, ..Limits::default() };
-    assert!(matches!(load(&fs, &policy(), shallow, &program), Err(LoadError::LimitExceeded(_))));
+    assert!(matches!(load(&fs, &policy(), shallow, &program), Err(LoadError::LimitExceeded { .. })));
     let few = Limits { max_exprs: 3, ..Limits::default() };
-    assert!(matches!(load(&fs, &policy(), few, &program), Err(LoadError::LimitExceeded(_))));
+    assert!(matches!(load(&fs, &policy(), few, &program), Err(LoadError::LimitExceeded { .. })));
 
     let tiny = Limits { max_value_size: 8, ..Limits::default() };
     let receipt = execute(&fs, &load(&fs, &policy(), tiny, &program).unwrap(), ContentCapture::Omit).receipt;
@@ -539,7 +539,7 @@ fn only_the_host_can_enable_inline_capture() {
 
     // Programs have no way to ask for it…
     let asks = format!("capture: inline\n{}", sentinel_program(false));
-    assert_eq!(meatyaml::compile(&asks).unwrap_err().message, "unknown key `capture`");
+    assert_eq!(meatyaml::compile(&asks).unwrap_err().kind, meatyaml::ErrorKind::UnknownKey);
     // …and a model saying so changes nothing.
     let (fs, _) = boot(5);
     let src = THINKER.replace("content: meat", "content: \"capture: inline\"");
@@ -605,4 +605,165 @@ fn omitted_receipts_are_deterministic() {
     let a = outcome(&boot(9).0, COMPOSER, ContentCapture::Omit).unwrap();
     let b = outcome(&boot(9).0, COMPOSER, ContentCapture::Omit).unwrap();
     assert_eq!(a, b);
+}
+
+// ── M4.1 closeout: real commit conflict, ordering, pinning, load diagnostics ──
+
+#[test]
+fn commit_conflict_with_a_real_second_writer() {
+    let (fs, host) = boot(1);
+    let calls = counter(&fs, &host, "/tools/test/counter");
+    let shared = fs.bind(&root(&host), &p("/state/shared"), Value::from("initial")).unwrap();
+    let src = r#"
+agent: { name: a }
+authority: [{ path: /tools/test/counter, rights: [invoke] }, { path: /state, rights: [write] }]
+flow:
+  - id: count
+    invoke: { path: /tools/test/counter, input: null }
+  - write: { path: /state/shared, from: count }
+  - write: { path: /state/other, value: staged }
+outputs: { count: count }
+"#;
+    let loaded = load(&fs, &policy(), Limits::default(), &meatyaml::compile(src).unwrap()).unwrap();
+
+    // Immediately before the execution commits, the host commits a different
+    // value to /state/shared through its own, genuine MeatFS transaction.
+    let mut second_writer_ran = false;
+    let outcome = execute_with(&fs, &loaded, ContentCapture::Omit, &mut || {
+        let tx = fs.transaction();
+        tx.write(&root(&host), shared, Value::from("second writer")).unwrap();
+        tx.commit().unwrap();
+        second_writer_ran = true;
+    });
+    assert!(second_writer_ran);
+    let receipt = &outcome.receipt;
+
+    let error = receipt.error.as_ref().unwrap();
+    assert_eq!((error.kind, error.node, error.object), (ExecutionErrorKind::TransactionConflict, None, Some(shared)));
+    assert_eq!(receipt.transaction, TxOutcome::RolledBack);
+    assert!(!receipt.succeeded());
+    assert!(outcome.outputs.is_empty() && receipt.outputs.is_empty(), "no speculative outputs");
+
+    // Every node finished; their MeatFS changes did not survive.
+    assert!(receipt.nodes.iter().all(|n| n.state == NodeState::Succeeded));
+    let staged: Vec<_> = receipt.nodes.iter().map(|n| n.staged).collect();
+    assert_eq!(staged, [StagedChanges::None, StagedChanges::RolledBack, StagedChanges::RolledBack]);
+    assert_eq!(fs.read(&root(&host), shared).unwrap(), Value::from("second writer"), "competing commit preserved");
+    assert_eq!(fs.resolve(&p("/state/other")), None, "failed execution's creation discarded");
+
+    // Exactly one invocation; nothing was retried.
+    assert_eq!(count(&calls), 1);
+    assert_eq!(receipt.schedule.len(), 3);
+    let counter_id = fs.resolve(&p("/tools/test/counter")).unwrap();
+    let invocations =
+        receipt.events.iter().filter(|e| e.object == counter_id && matches!(e.kind, EventKind::Invoked { .. }));
+    assert_eq!(invocations.count(), 1);
+}
+
+#[test]
+fn unknown_purity_takes_the_conservative_path() {
+    let (fs, host) = boot(1);
+    counter(&fs, &host, "/tools/test/counter");
+    // A data object at an invocable path: no declaration, so purity unknown.
+    fs.bind(&root(&host), &p("/tools/test/opaque"), Value::Null).unwrap();
+    let src = r#"
+agent: { name: a }
+authority: [{ path: /tools, rights: [invoke] }]
+flow:
+  - invoke: { path: /tools/test/opaque, input: null }
+  - invoke: { path: /tools/echo, input: { text: x } }
+  - invoke: { path: /tools/test/counter, input: null }
+"#;
+    let loaded = load(&fs, &policy(), Limits::default(), &meatyaml::compile(src).unwrap()).unwrap();
+    assert_eq!(loaded.nodes()[0].declared, None);
+    assert_eq!(loaded.derived_order(), &[(NodeId(0), NodeId(2))], "unknown is chained; the pure echo is not");
+}
+
+#[test]
+fn explicit_order_survives_against_node_id_order() {
+    let (fs, host) = boot(1);
+    // Three effectful invocations sharing one clock: each returns its call order.
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    for name in ["a", "b", "c"] {
+        capability::mount(&fs, &root(&host), &p(&format!("/tools/clock/{name}")), Counter(clock.clone())).unwrap();
+    }
+    let invoke = |id, name: &str| Node {
+        id: NodeId(id),
+        label: None,
+        op: Op::Invoke(meatyaml::InvokeOp {
+            target: p(&format!("/tools/clock/{name}")),
+            input: Some(Value::Null),
+            uses: vec![],
+        }),
+    };
+    // n2 must precede n0; n1 is unconstrained by the source.
+    let graph = Graph::new(
+        vec![invoke(0, "a"), invoke(1, "b"), invoke(2, "c")],
+        vec![Edge { from: NodeId(2), to: NodeId(0), kind: EdgeKind::Order }],
+        vec![],
+    );
+    let program = Program { agent: "a".into(), authority: vec![], graph };
+    let loaded = load(&fs, &policy(), Limits::default(), &program).unwrap();
+    // Topological order n1, n2, n0: chaining adds n1 → n2; n2 → n0 already holds.
+    assert_eq!(loaded.derived_order(), &[(NodeId(1), NodeId(2))]);
+    let receipt = execute(&fs, &loaded, ContentCapture::Inline).receipt;
+    assert_eq!(receipt.schedule, [1, 2, 0].map(NodeId));
+    let ticks: Vec<_> = receipt.nodes.iter().map(|n| inline(&n.output).clone()).collect();
+    assert_eq!(ticks, [3, 1, 2].map(Value::Int), "n0 ran last despite the lowest id");
+}
+
+/// Declares Pure until told otherwise; counts its invocations.
+struct Fickle {
+    effectful: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+impl Capability for Fickle {
+    type Input = Value;
+    type Output = Value;
+    fn describe(&self) -> &'static str {
+        "changes its declaration on request"
+    }
+    fn meta(&self) -> CapabilityMeta {
+        let purity =
+            if self.effectful.load(std::sync::atomic::Ordering::SeqCst) { Purity::Effectful } else { Purity::Pure };
+        CapabilityMeta::new(purity, Determinism::Deterministic)
+    }
+    fn invoke(&self, _: &CapabilityContext<'_>, input: Value) -> Result<Value, Fault> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(input)
+    }
+}
+
+#[test]
+fn execution_uses_the_declaration_scheduling_used() {
+    let (fs, host) = boot(1);
+    let effectful = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let fickle = Fickle { effectful: effectful.clone(), calls: calls.clone() };
+    capability::mount(&fs, &root(&host), &p("/tools/test/fickle"), fickle).unwrap();
+    let src = "agent: { name: a }\nauthority: [{ path: /tools, rights: [invoke] }]\nflow:\n  - invoke: { path: /tools/test/fickle, input: 1 }\n";
+    let loaded = load(&fs, &policy(), Limits::default(), &meatyaml::compile(src).unwrap()).unwrap();
+    assert_eq!(loaded.nodes()[0].declared.as_ref().unwrap().purity, Purity::Pure);
+
+    effectful.store(true, std::sync::atomic::Ordering::SeqCst);
+    let receipt = execute(&fs, &loaded, ContentCapture::Omit).receipt;
+    assert_eq!(receipt.error.unwrap().kind, ExecutionErrorKind::DeclarationChanged);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "refused before running");
+    assert_eq!(
+        receipt.nodes[0].declared.as_ref().unwrap().purity,
+        Purity::Pure,
+        "receipt shows the pinned declaration"
+    );
+}
+
+#[test]
+fn load_errors_render_without_source_text() {
+    let (fs, _) = boot(1);
+    let src = format!(
+        "agent: {{ name: a }}\nauthority: [{{ path: /memory/{SENTINEL}, rights: [write] }}]\nflow:\n  - write: {{ path: /memory/{SENTINEL}, value: 1 }}\n"
+    );
+    let e = load(&fs, &policy(), Limits::default(), &meatyaml::compile(&src).unwrap()).err().unwrap();
+    assert!(matches!(e, LoadError::Authority(meatfs::Error::PolicyDenied { .. })));
+    assert!(!leaks(&e.render(false)), "{}", e.render(false));
+    assert!(leaks(&e.render(true)));
 }

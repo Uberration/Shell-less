@@ -354,20 +354,66 @@ fn fnv1a_128(bytes: &[u8]) -> u128 {
     bytes.iter().fold(OFFSET, |hash, &b| (hash ^ u128::from(b)).wrapping_mul(PRIME))
 }
 
+/// What kind of compile error occurred. Stable and content-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The text is not well-formed YAML.
+    Syntax,
+    /// A construct has the wrong shape: not a map, not a list, too many keys.
+    Shape,
+    MissingKey,
+    UnknownKey,
+    UnknownOperation,
+    UnknownConstructor,
+    UnknownRight,
+    InvalidPath,
+    InvalidValue,
+    /// A step needs authority the program does not declare.
+    Undeclared,
+    DuplicateId,
+    UnknownReference,
+    /// Both literal data and `from` were given.
+    ConflictingData,
+    /// A write has nothing to write.
+    MissingData,
+}
+
+/// A compile error. `kind`, `at_redacted` and `position` never contain
+/// source text; `at` and `detail` may, and are shown only when the host
+/// chooses to reveal content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Error {
-    /// Location within the program, e.g. `flow[1].write.from`.
+    pub kind: ErrorKind,
+    /// Location, e.g. `flow[2].compose.map.messages`. May quote source keys.
     pub at: String,
-    pub message: String,
+    /// The same location with every source-controlled segment replaced by
+    /// `<name>`.
+    pub at_redacted: String,
+    /// Line and column (both 1-based), where the YAML parser reports them.
+    pub position: Option<(usize, usize)>,
+    /// Human-readable explanation. May quote source text.
+    pub detail: String,
+}
+
+impl Error {
+    /// Render for a diagnostic surface: with source text only if `reveal`.
+    pub fn render(&self, reveal: bool) -> String {
+        let at = if reveal { &self.at } else { &self.at_redacted };
+        let mut out = format!("compile error kind={:?}", self.kind);
+        if !at.is_empty() {
+            out += &format!(" at={at}");
+        }
+        if let Some((line, column)) = self.position {
+            out += &format!(" line={line} column={column}");
+        }
+        out += &if reveal { format!(" detail={}", self.detail) } else { " detail=<omitted>".to_owned() };
+        out
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.at.is_empty() {
-            f.write_str(&self.message)
-        } else {
-            write!(f, "{}: {}", self.at, self.message)
-        }
+        f.write_str(&self.render(true))
     }
 }
 

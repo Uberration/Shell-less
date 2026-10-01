@@ -6,17 +6,23 @@
 //! shell-less run   [--seed N] [--capture inline] [--show-outputs] <program.meat.yaml>
 //! ```
 //!
-//! Diagnostics never print payloads unless the host passes
-//! `--capture inline`. Graph results are printed only on `--show-outputs`.
+//! The capture policy is chosen before the program is parsed and governs
+//! every diagnostic: compile errors, load errors, the IR dump, the receipt
+//! and the namespace dump. Under the default (`omit`), none of them prints
+//! source text (names, paths, keys, labels, literals) or payloads; they keep
+//! kinds, locations, opaque identities, structure and outcomes. Graph
+//! results are printed only on `--show-outputs`, which does not reveal
+//! diagnostic content.
 
 use capability::builtin::{Echo, Fail, Upper};
 use meatfs::{EventKind, GrantSet, MeatFs, NodeKind, Path, Policy, Rights, Seed, Target, Value};
 use meatyaml::{EdgeKind, Op, Program, Selector, ValueExpr};
 use runtime::{CapturedValue, ContentCapture, ExecutionReceipt, Limits, ResolvedTarget};
+use std::fmt::Display;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: shell-less check [--capture inline] <program.meat.yaml>
-       shell-less run [--seed N] [--capture inline] [--show-outputs] <program.meat.yaml>";
+const USAGE: &str = "usage: shell-less check [--capture omit|inline] <program.meat.yaml>
+       shell-less run [--seed N] [--capture omit|inline] [--show-outputs] <program.meat.yaml>";
 
 struct Args {
     command: String,
@@ -66,40 +72,69 @@ fn main() -> ExitCode {
     match drive(&args) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
-        Err(e) => {
-            eprintln!("error: {e}");
+        Err(rendered) => {
+            eprintln!("error: {rendered}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// A payload as diagnostics may show it.
-fn shown(capture: ContentCapture, value: &Value) -> String {
-    match capture {
-        ContentCapture::Omit => "<omitted>".to_owned(),
-        ContentCapture::Inline => value.to_string(),
+/// What diagnostics may show, decided by the host's capture policy.
+#[derive(Clone, Copy)]
+struct Show(ContentCapture);
+
+impl Show {
+    fn reveal(self) -> bool {
+        self.0 == ContentCapture::Inline
+    }
+
+    fn redact(self, text: impl Display, placeholder: &str) -> String {
+        if self.reveal() {
+            text.to_string()
+        } else {
+            placeholder.to_owned()
+        }
+    }
+
+    /// A namespace path written in, or derived from, the program.
+    fn path(self, path: impl Display) -> String {
+        self.redact(path, "<path>")
+    }
+
+    /// Any other source-controlled string: names, keys, labels.
+    fn name(self, name: impl Display) -> String {
+        self.redact(name, "<name>")
+    }
+
+    fn value(self, value: &Value) -> String {
+        self.redact(value, "<omitted>")
+    }
+
+    fn captured(self, value: &CapturedValue) -> String {
+        match value {
+            CapturedValue::Omitted => "<omitted>".to_owned(),
+            CapturedValue::Inline(v) => v.to_string(),
+        }
     }
 }
 
-fn captured(value: &CapturedValue) -> String {
-    match value {
-        CapturedValue::Omitted => "<omitted>".to_owned(),
-        CapturedValue::Inline(v) => v.to_string(),
-    }
-}
-
-/// Returns whether the execution committed.
-fn drive(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
+/// Returns whether the execution committed. Errors come back already
+/// rendered under the capture policy.
+fn drive(args: &Args) -> Result<bool, String> {
+    let show = Show(args.capture);
+    // The file name is a host argument, not program content.
     let source = std::fs::read_to_string(&args.file).map_err(|e| format!("{}: {e}", args.file))?;
-    let program = meatyaml::compile(&source)?;
+    let program = meatyaml::compile(&source).map_err(|e| e.render(show.reveal()))?;
     section("MEAT IR");
-    print_ir(&program, args.capture);
+    print_ir(&program, show);
     if args.command == "check" {
         return Ok(true);
     }
 
-    let (fs, host) = boot(args.seed.map_or_else(Seed::entropy, Seed::fixed))?;
-    let loaded = runtime::load(&fs, &policy()?, Limits::default(), &program)?;
+    let host_error = |e: meatfs::Error| format!("host: {}", e.redacted());
+    let (fs, host) = boot(args.seed.map_or_else(Seed::entropy, Seed::fixed)).map_err(host_error)?;
+    let policy = policy().map_err(host_error)?;
+    let loaded = runtime::load(&fs, &policy, Limits::default(), &program).map_err(|e| e.render(show.reveal()))?;
 
     section("resolved");
     for (node, resolved) in loaded.graph().nodes.iter().zip(loaded.nodes()) {
@@ -109,8 +144,9 @@ fn drive(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
             ResolvedTarget::None => "-".to_owned(),
         };
         let grant = resolved.grant.map(|g| g.short()).unwrap_or_else(|| "-".to_owned());
-        let uses: String = resolved.uses.iter().map(|u| format!("  +{} {}", u.path, u.grant.short())).collect();
-        println!("  {}  {:<7} {}  {target}  {grant}{uses}", node.id, node.op.name(), describe_target(&node.op));
+        let uses: String =
+            resolved.uses.iter().map(|u| format!("  +{} {}", show.path(&u.path), u.grant.short())).collect();
+        println!("  {}  {:<7} {}  {target}  {grant}{uses}", node.id, node.op.name(), describe_target(&node.op, show));
     }
     for (from, to) in loaded.derived_order() {
         println!("  derived order  {from} → {to}");
@@ -118,19 +154,22 @@ fn drive(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
 
     let outcome = runtime::execute(&fs, &loaded, args.capture);
     section("receipt");
-    print_receipt(&program, &outcome.receipt);
+    print_receipt(&program, &outcome.receipt, show);
 
     section("namespace");
     let root = root(&host);
-    for (path, object, kind) in fs.walk(&root, &Path::root())? {
+    let walk = fs.walk(&root, &Path::root()).map_err(host_error)?;
+    for (path, object, kind) in walk {
         match kind {
             NodeKind::Data => {
-                println!("  {}  {path} = {}", object.short(), shown(args.capture, &fs.read(&root, object)?))
+                let value = fs.read(&root, object).map_err(host_error)?;
+                println!("  {}  {} = {}", object.short(), show.path(&path), show.value(&value));
             }
-            NodeKind::Capability => println!("  {}  {path}  <capability>", object.short()),
+            NodeKind::Capability => println!("  {}  {}  <capability>", object.short(), show.path(&path)),
         }
     }
 
+    // The result channel: explicit, and independent of diagnostic capture.
     if args.show_outputs {
         section("outputs");
         for (name, value) in &outcome.outputs {
@@ -166,55 +205,54 @@ fn root(host: &GrantSet) -> meatfs::Access<'_> {
     host.access(host.iter().next().expect("genesis issues the root grant").id()).expect("grant is in its set")
 }
 
-fn describe_target(op: &Op) -> String {
+fn describe_target(op: &Op, show: Show) -> String {
     match op {
         Op::Compose(expr) => {
             let sources: Vec<_> = expr.sources().iter().map(ToString::to_string).collect();
             format!("[{}]", sources.join(", "))
         }
-        op => op.target().map(ToString::to_string).unwrap_or_default(),
+        op => op.target().map(|t| show.path(t)).unwrap_or_default(),
     }
 }
 
-/// The shape of a composition, with literal payloads elided unless inline.
-fn shape(expr: &ValueExpr, capture: ContentCapture) -> String {
+/// The shape of a composition: constructors and resolved references are
+/// structure; keys, selector keys and literals are source text.
+fn shape(expr: &ValueExpr, show: Show) -> String {
     match expr {
-        ValueExpr::Literal(v) => format!("literal {}", shown(capture, v)),
+        ValueExpr::Literal(v) => format!("literal {}", show.value(v)),
         ValueExpr::Select { source, path } => {
             let path: Vec<String> = path
                 .iter()
                 .map(|s| match s {
-                    Selector::Key(k) => format!(".{k}"),
+                    Selector::Key(k) => format!(".{}", show.name(k)),
                     Selector::Index(i) => format!("[{i}]"),
                 })
                 .collect();
             format!("{source}{}", path.concat())
         }
         ValueExpr::Map(fields) => {
-            let fields: Vec<_> = fields.iter().map(|(k, e)| format!("{k}: {}", shape(e, capture))).collect();
+            let fields: Vec<_> = fields.iter().map(|(k, e)| format!("{}: {}", show.name(k), shape(e, show))).collect();
             format!("{{{}}}", fields.join(", "))
         }
-        ValueExpr::List(items) => {
-            format!("[{}]", items.iter().map(|e| shape(e, capture)).collect::<Vec<_>>().join(", "))
-        }
+        ValueExpr::List(items) => format!("[{}]", items.iter().map(|e| shape(e, show)).collect::<Vec<_>>().join(", ")),
     }
 }
 
-fn print_ir(program: &Program, capture: ContentCapture) {
+fn print_ir(program: &Program, show: Show) {
     let graph = &program.graph;
-    println!("  agent  {}", program.agent);
+    println!("  agent  {}", show.name(&program.agent));
     println!("  graph  {}", graph.id);
     for (path, rights) in &program.authority {
-        println!("  declare {path} [{rights}]");
+        println!("  declare {} [{rights}]", show.path(path));
     }
     for node in &graph.nodes {
         let data = match &node.op {
-            Op::Compose(expr) => format!(" = {}", shape(expr, capture)),
-            op => op.literal().map(|v| format!(" ← {}", shown(capture, v))).unwrap_or_default(),
+            Op::Compose(expr) => format!(" = {}", shape(expr, show)),
+            op => op.literal().map(|v| format!(" ← {}", show.value(v))).unwrap_or_default(),
         };
-        let label = node.label.as_deref().map(|l| format!("  ({l})")).unwrap_or_default();
-        let uses: String = node.op.uses().iter().map(|u| format!("  +{} [{}]", u.path, u.rights)).collect();
-        let target = node.op.target().map(|t| format!(" {t}")).unwrap_or_default();
+        let label = node.label.as_deref().map(|l| format!("  ({})", show.name(l))).unwrap_or_default();
+        let uses: String = node.op.uses().iter().map(|u| format!("  +{} [{}]", show.path(&u.path), u.rights)).collect();
+        let target = node.op.target().map(|t| format!(" {}", show.path(t))).unwrap_or_default();
         println!("  {}  {:<7}{target}{data}{uses}{label}", node.id, node.op.name());
     }
     for edge in &graph.edges {
@@ -225,20 +263,20 @@ fn print_ir(program: &Program, capture: ContentCapture) {
         println!("  {kind}  {} → {}", edge.from, edge.to);
     }
     for output in &graph.outputs {
-        println!("  output {} ← {}", output.name, output.source);
+        println!("  output {} ← {}", show.name(&output.name), output.source);
     }
 }
 
-fn print_receipt(program: &Program, receipt: &ExecutionReceipt) {
+fn print_receipt(program: &Program, receipt: &ExecutionReceipt, show: Show) {
     println!("  execution  {}", receipt.execution);
     println!("  graph      {}", receipt.graph);
-    println!("  principal  {} ({})", receipt.principal, program.agent);
+    println!("  principal  {} ({})", receipt.principal, show.name(&program.agent));
     println!("  capture    {:?}", receipt.capture);
     for g in &receipt.grants {
         let target = match &g.target {
             Target::Object(o) => o.short(),
-            Target::Name(p) => format!("name {p}"),
-            Target::Namespace(p) => format!("namespace {p}"),
+            Target::Name(p) => format!("name {}", show.path(p)),
+            Target::Namespace(p) => format!("namespace {}", show.path(p)),
         };
         println!("  grant      {}  {target} [{}]", g.grant.short(), g.rights);
     }
@@ -252,7 +290,7 @@ fn print_receipt(program: &Program, receipt: &ExecutionReceipt) {
         let grant = n.grant.map(|g| g.short()).unwrap_or_else(|| "-".to_owned());
         let detail = match (&n.output, &n.error) {
             (_, Some(e)) => format!("{:?}", e.kind),
-            (Some(v), None) => format!("→ {}", captured(v)),
+            (Some(v), None) => format!("→ {}", show.captured(v)),
             (None, None) => String::new(),
         };
         let state = format!("{:?}", n.state);
@@ -269,20 +307,20 @@ fn print_receipt(program: &Program, receipt: &ExecutionReceipt) {
     for e in &receipt.events {
         let node = e.cause.map(|c| c.node.to_string()).unwrap_or_default();
         let grant = e.grant.map(|g| g.short()).unwrap_or_default();
-        println!("  event      #{:<3} {node}  {}  {grant}  {}", e.seq, e.object.short(), kind(&e.kind));
+        println!("  event      #{:<3} {node}  {}  {grant}  {}", e.seq, e.object.short(), kind(&e.kind, show));
     }
     println!("  transaction {:?}", receipt.transaction);
     if let Some(e) = &receipt.error {
         println!("  error      {e}");
     }
     for (name, value) in &receipt.outputs {
-        println!("  output     {name} = {}", captured(value));
+        println!("  output     {} = {}", show.name(name), show.captured(value));
     }
 }
 
-fn kind(kind: &EventKind) -> String {
+fn kind(kind: &EventKind, show: Show) -> String {
     match kind {
-        EventKind::Bound(path) => format!("bound {path}"),
+        EventKind::Bound(path) => format!("bound {}", show.path(path)),
         EventKind::Read { version } => format!("read v{version}"),
         EventKind::Staged => "staged".to_owned(),
         EventKind::Written { version } => format!("written v{version}"),
