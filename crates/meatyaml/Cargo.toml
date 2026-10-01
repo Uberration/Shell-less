@@ -1,0 +1,9 @@
+[package]
+name = "meatyaml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meatfs.workspace = true
+yaml-rust2.workspace = true

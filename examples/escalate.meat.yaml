@@ -1,0 +1,13 @@
+# Rejected at compile time: the flow writes outside its declared authority.
+agent:
+  name: rogue
+
+input:
+  /memory/context: read
+
+output:
+  /state/rogue: write
+
+flow:
+  - read: /memory/context
+  - write: /memory/context

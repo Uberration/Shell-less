@@ -1,0 +1,18 @@
+# The smallest coherent Shell-less program.
+agent:
+  name: echoer
+
+input:
+  /tools/echo: invoke
+
+output:
+  /state/result: write
+
+flow:
+  - invoke:
+      path: /tools/echo
+      input:
+        text: "MEAT"
+  - write:
+      path: /state/result
+      from: previous

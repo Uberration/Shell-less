@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+meatfs = { path = "crates/meatfs" }
+meatyaml = { path = "crates/meatyaml" }
+capability = { path = "crates/capability" }
+runtime = { path = "crates/runtime" }
+yaml-rust2 = "0.10"
