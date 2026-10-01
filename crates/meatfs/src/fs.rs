@@ -198,8 +198,8 @@ pub enum EventKind {
     },
 }
 
-/// A live stream of events within a grant's target, delivered as recorded
-/// (under the journal's recording policy at that moment).
+/// A live stream of events within a grant's target, delivered through the
+/// view its subscription is entitled to.
 pub struct Subscription {
     rx: Receiver<Event>,
 }
@@ -256,7 +256,8 @@ struct Journal {
     /// What new records may retain. Defaults to `Omit`.
     capture: ContentCapture,
     events: Vec<Event>,
-    subscribers: Vec<(Target, Sender<Event>)>,
+    /// Each subscriber's scope and the view it is entitled to.
+    subscribers: Vec<(Target, ContentCapture, Sender<Event>)>,
 }
 
 impl Event {
@@ -389,7 +390,9 @@ impl MeatFs {
         let kind = kind(journal.capture);
         let event =
             Event { seq: journal.seq, object, principal: who.principal, grant: who.grant, cause: who.cause, kind };
-        journal.subscribers.retain(|(target, tx)| !covers(target, object, names) || tx.send(event.clone()).is_ok());
+        journal
+            .subscribers
+            .retain(|(target, view, tx)| !covers(target, object, names) || tx.send(event.viewed(*view)).is_ok());
         journal.events.push(event);
     }
 
@@ -546,18 +549,33 @@ impl MeatFs {
         })
     }
 
-    /// Receive every future event within the presented grant's target.
+    /// Receive every future event within the presented grant's target, as
+    /// an omitted view: no event carries content, whatever the journal
+    /// retains. Needs subscribe rights.
     pub fn subscribe(&self, access: &Access<'_>) -> Result<Subscription> {
+        self.subscribe_view(access, Rights::SUBSCRIBE, ContentCapture::Omit)
+    }
+
+    /// Receive future events exactly as the journal retains them. Needs the
+    /// authority `journal_retained` needs (read and inspect) in addition to
+    /// subscribe, all on one namespace grant, whose scope is the stream's.
+    pub fn subscribe_retained(&self, access: &Access<'_>) -> Result<Subscription> {
+        self.subscribe_view(access, Rights::SUBSCRIBE | Rights::INSPECT | Rights::READ, ContentCapture::Inline)
+    }
+
+    fn subscribe_view(&self, access: &Access<'_>, needed: Rights, view: ContentCapture) -> Result<Subscription> {
         self.state.read().unwrap().verify_grant(self.domain, access)?;
         let target = access.grant.target().clone();
-        if !access.grant.rights().contains(Rights::SUBSCRIBE) {
+        let entitled = access.grant.rights().contains(needed)
+            && (view == ContentCapture::Omit || matches!(target, Target::Namespace(_)));
+        if !entitled {
             return Err(match target {
-                Target::Object(object) => Error::Denied { object, needed: Rights::SUBSCRIBE },
-                Target::Name(path) | Target::Namespace(path) => Error::PolicyDenied { path, rights: Rights::SUBSCRIBE },
+                Target::Object(object) => Error::Denied { object, needed },
+                Target::Name(path) | Target::Namespace(path) => Error::PolicyDenied { path, rights: needed },
             });
         }
         let (tx, rx) = mpsc::channel();
-        self.journal.lock().unwrap().subscribers.push((target, tx));
+        self.journal.lock().unwrap().subscribers.push((target, view, tx));
         Ok(Subscription { rx })
     }
 
@@ -1138,5 +1156,29 @@ mod tests {
         let agent = access(&grants, 0);
         assert!(fs.set_journal_capture(&agent, ContentCapture::Inline).is_err());
         assert!(fs.journal_retained(&agent, &Path::root()).is_err());
+    }
+
+    #[test]
+    fn subscriptions_never_widen_access_to_retained_content() {
+        let (fs, host) = setup();
+        let r = root(&host);
+        fs.set_journal_capture(&r, ContentCapture::Inline).unwrap();
+        let plain = fs.subscribe(&r).unwrap();
+        let retained = fs.subscribe_retained(&r).unwrap();
+        fs.bind(&r, &p("/state/kept-name"), Value::Null).unwrap();
+        let bound =
+            |sub: &Subscription| sub.drain().into_iter().find(|e| matches!(e.kind, EventKind::Bound(_))).unwrap().kind;
+        assert_eq!(bound(&plain), EventKind::Bound(CapturedValue::Omitted), "default view omits even inline records");
+        assert_eq!(bound(&retained), EventKind::Bound(CapturedValue::Inline(Value::from("/state/kept-name"))));
+
+        // Subscribe rights alone, or an object-scoped grant, never reach retained content.
+        let request = AuthorityRequest::new("agent").want(p("/tools/double"), Rights::INVOKE | Rights::SUBSCRIBE);
+        let policy = Policy::default().allow(p("/tools"), Rights::ALL);
+        let grants = fs.issue(&policy, &request).unwrap();
+        assert!(fs.subscribe(&access(&grants, 0)).is_ok());
+        assert!(fs.subscribe_retained(&access(&grants, 0)).is_err());
+        let all = AuthorityRequest::new("agent").want(p("/tools/double"), Rights::ALL);
+        let object_grant = fs.issue(&policy, &all).unwrap();
+        assert!(fs.subscribe_retained(&access(&object_grant, 0)).is_err(), "retained scope must be a namespace");
     }
 }

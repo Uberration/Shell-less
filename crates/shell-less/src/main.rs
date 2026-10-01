@@ -3,8 +3,14 @@
 //!
 //! ```text
 //! shell-less check [--capture inline] <program.meat.yaml>
-//! shell-less run   [--seed N] [--capture inline] [--show-outputs] <program.meat.yaml>
+//! shell-less run   [--seed N] [--capture inline] [--show-outputs]
+//!                  [--checkpoint FILE --tokenizer FILE] <program.meat.yaml>
 //! ```
+//!
+//! With `--checkpoint` and `--tokenizer`, the host loads a llama2.c v0
+//! float32 checkpoint and its tokenizer, validates both, and mounts the
+//! model at `/models/local/stories/infer`. Programs reach it only through
+//! an ordinary invoke grant; they cannot name files.
 //!
 //! The capture policy is chosen before the program is parsed and governs
 //! every diagnostic: compile errors, load errors, the IR dump, the receipt
@@ -17,12 +23,17 @@
 use capability::builtin::{Echo, Fail, Upper};
 use meatfs::{EventKind, GrantSet, MeatFs, NodeKind, Path, Policy, Rights, Seed, Value};
 use meatyaml::{EdgeKind, Op, Program, Selector, ValueExpr};
+use model::local::{Artifact, LocalError, LocalLimits, LocalModel};
 use runtime::{CapturedValue, ContentCapture, ExecutionReceipt, Limits, RecordedTarget, ResolvedTarget};
 use std::fmt::Display;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: shell-less check [--capture omit|inline] <program.meat.yaml>
-       shell-less run [--seed N] [--capture omit|inline] [--show-outputs] <program.meat.yaml>";
+       shell-less run [--seed N] [--capture omit|inline] [--show-outputs]
+                      [--checkpoint FILE --tokenizer FILE] <program.meat.yaml>";
+
+/// Where the host mounts the local model when it is given artifacts.
+const LOCAL_MODEL_PATH: &str = "/models/local/stories/infer";
 
 struct Args {
     command: String,
@@ -30,6 +41,8 @@ struct Args {
     seed: Option<u64>,
     capture: ContentCapture,
     show_outputs: bool,
+    /// Host-supplied model artifacts: checkpoint and tokenizer, together.
+    model: Option<(String, String)>,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -43,12 +56,16 @@ fn parse(args: &[String]) -> Option<Args> {
         seed: None,
         capture: ContentCapture::Omit,
         show_outputs: false,
+        model: None,
     };
+    let (mut checkpoint, mut tokenizer) = (None, None);
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--seed" if command == "run" => parsed.seed = Some(rest.next()?.parse().ok()?),
             "--show-outputs" if command == "run" => parsed.show_outputs = true,
+            "--checkpoint" if command == "run" => checkpoint = Some(rest.next()?.clone()),
+            "--tokenizer" if command == "run" => tokenizer = Some(rest.next()?.clone()),
             "--capture" => {
                 parsed.capture = match rest.next()?.as_str() {
                     "omit" => ContentCapture::Omit,
@@ -60,6 +77,11 @@ fn parse(args: &[String]) -> Option<Args> {
             _ => return None,
         }
     }
+    parsed.model = match (checkpoint, tokenizer) {
+        (Some(c), Some(t)) => Some((c, t)),
+        (None, None) => None,
+        _ => return None, // one artifact without the other is a usage error
+    };
     (!parsed.file.is_empty()).then_some(parsed)
 }
 
@@ -131,8 +153,21 @@ fn drive(args: &Args) -> Result<bool, String> {
         return Ok(true);
     }
 
+    // The local model is loaded and validated in full before anything is
+    // mounted; a failure leaves no partial mount behind.
+    let local = match &args.model {
+        None => None,
+        Some((checkpoint, tokenizer)) => {
+            let loaded = LocalModel::load(checkpoint.as_ref(), tokenizer.as_ref(), LocalLimits::default());
+            Some(loaded.map_err(|e| startup_error(&e, args, show))?)
+        }
+    };
     let host_error = |e: meatfs::Error| format!("host: {}", e.redacted());
     let (fs, host) = boot(args.seed.map_or_else(Seed::entropy, Seed::fixed), args.capture).map_err(host_error)?;
+    if let Some(local) = local {
+        capability::mount(&fs, &root(&host), &Path::parse(LOCAL_MODEL_PATH).map_err(host_error)?, local)
+            .map_err(host_error)?;
+    }
     let policy = policy().map_err(host_error)?;
     let loaded = runtime::load(&fs, &policy, Limits::default(), args.capture, &program).map_err(|e| e.render())?;
 
@@ -177,6 +212,17 @@ fn drive(args: &Args) -> Result<bool, String> {
         }
     }
     Ok(outcome.receipt.succeeded())
+}
+
+/// A model-loading failure as diagnostics may show it: the host path of the
+/// failing artifact appears only under inline capture.
+fn startup_error(e: &LocalError, args: &Args, show: Show) -> String {
+    let path = match (e.artifact(), &args.model) {
+        (Artifact::Checkpoint, Some((checkpoint, _))) => checkpoint.as_str(),
+        (Artifact::Tokenizer, Some((_, tokenizer))) => tokenizer.as_str(),
+        (_, None) => "",
+    };
+    format!("host: model artifacts: {e} (file {})", show.path(path))
 }
 
 /// The host namespace: native capabilities, mock models and seed memory.

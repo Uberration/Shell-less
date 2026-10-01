@@ -942,3 +942,98 @@ fn omitted_views_hide_inline_history_and_results_stay_exact() {
     assert_retains_no_content(&later.receipt);
     assert_eq!(later.outputs, BTreeMap::from([("result".to_owned(), Value::Int(1))]));
 }
+
+// ── M5: real inference is an ordinary node ──────────────────────────────────
+
+const STORY: &str = r#"
+agent: { name: storyteller }
+authority:
+  - { path: /models/local/stories/infer, rights: [invoke] }
+  - { path: /state/story, rights: [write] }
+flow:
+  - id: request
+    compose:
+      map:
+        messages:
+          list:
+            - map: { role: { literal: user }, content: { literal: hello world } }
+        parameters:
+          map: { max_tokens: { literal: 6 } }
+  - id: infer
+    invoke: { path: /models/local/stories/infer, from: request }
+  - id: store
+    write: { path: /state/story, from: infer }
+outputs:
+  story: store
+"#;
+
+fn with_local_model(seed: u64) -> (MeatFs, GrantSet) {
+    let (fs, host) = boot(seed);
+    let model = model::local::fixture::model(model::local::LocalLimits::default());
+    capability::mount(&fs, &root(&host), &p("/models/local/stories/infer"), model).unwrap();
+    (fs, host)
+}
+
+#[test]
+fn local_inference_feeds_a_transactional_write_and_an_output() {
+    let (fs, host) = with_local_model(3);
+    let run = outcome(&fs, STORY, ContentCapture::Omit).unwrap();
+    let receipt = &run.receipt;
+    assert!(receipt.succeeded(), "{:?}", receipt.error);
+
+    let story = &run.outputs["story"];
+    assert_eq!(story.get("usage").unwrap().get("input_tokens"), Some(&Value::Int(3)));
+    assert!(matches!(story.get("finish"), Some(Value::Text(f)) if f == "length" || f == "stop"));
+    let stored = fs.resolve(&p("/state/story")).unwrap();
+    assert_eq!(&fs.read(&root(&host), stored).unwrap(), story, "committed through the ordinary write");
+
+    // The node holds exactly its invoke grant on the model's identity.
+    let model_id = fs.resolve(&p("/models/local/stories/infer")).unwrap();
+    let infer = &receipt.nodes[1];
+    assert_eq!((infer.object, infer.uses.len()), (Some(model_id), 0));
+    let grant = receipt.grants.iter().find(|g| Some(g.grant) == infer.grant).unwrap();
+    assert_eq!((&grant.target, grant.rights), (&RecordedTarget::Object(model_id), Rights::INVOKE));
+    let declared = infer.declared.as_ref().unwrap();
+    assert_eq!((declared.purity, declared.determinism), (Purity::Effectful, Determinism::Nondeterministic));
+    assert_eq!(declared.invocation.implementation.as_deref(), Some(model::local::IMPLEMENTATION));
+    assert_retains_no_content(receipt);
+
+    // Repeatable in this environment: same seed, same artifacts, same receipt.
+    let (fs2, _) = with_local_model(3);
+    assert_eq!(outcome(&fs2, STORY, ContentCapture::Omit).unwrap(), run);
+}
+
+#[test]
+fn local_inference_failures_use_the_existing_machinery() {
+    let (fs, host) = with_local_model(3);
+    let before = snapshot(&fs, &host);
+    // A system message is outside the supported completion subset.
+    let src = STORY.replace("{ role: { literal: user }", "{ role: { literal: system }");
+    let receipt = outcome(&fs, &src, ContentCapture::Omit).unwrap().receipt;
+    assert_eq!(receipt.transaction, TxOutcome::RolledBack);
+    let error = receipt.error.unwrap();
+    let model_id = fs.resolve(&p("/models/local/stories/infer")).unwrap();
+    assert_eq!(
+        (error.node, error.object, error.kind),
+        (Some(NodeId(1)), Some(model_id), ExecutionErrorKind::InvalidInput)
+    );
+    assert_eq!(receipt.nodes[2].state, NodeState::Blocked);
+    assert_eq!(snapshot(&fs, &host), before);
+    let invocations = receipt.events.iter().filter(|e| e.object == model_id).count();
+    assert_eq!(invocations, 1, "invoked once, never retried");
+}
+
+#[test]
+fn local_inferences_are_ordered_conservatively() {
+    let (fs, _) = with_local_model(3);
+    let src = r#"
+agent: { name: a }
+authority: [{ path: /models/local/stories/infer, rights: [invoke] }]
+flow:
+  - invoke: { path: /models/local/stories/infer, input: { messages: [{ role: user, content: a }], parameters: { max_tokens: 2 } } }
+  - invoke: { path: /models/local/stories/infer, input: { messages: [{ role: user, content: b }], parameters: { max_tokens: 2 } } }
+"#;
+    let loaded =
+        load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &meatyaml::compile(src).unwrap()).unwrap();
+    assert_eq!(loaded.derived_order(), &[(NodeId(0), NodeId(1))], "declared effectful: chained");
+}

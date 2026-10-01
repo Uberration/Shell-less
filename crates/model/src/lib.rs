@@ -1,11 +1,13 @@
 //! The model capability contract: models are ordinary typed capabilities.
 //!
-//! This crate owns only the shape of inference — [`InferRequest`] →
-//! [`InferResponse`] — and deterministic mock implementations. It has no
-//! orchestration, memory, agent loop, provider, transport or prompt
-//! templating, and the runtime knows nothing about it: a model is mounted
-//! at a path such as `/models/mock/infer` and invoked like any capability.
+//! This crate owns the shape of inference — [`InferRequest`] →
+//! [`InferResponse`] — deterministic mock implementations, and one local
+//! reference backend ([`local`]). It has no orchestration, memory, agent
+//! loop, provider, transport or prompt templating, and the runtime knows
+//! nothing about it: a model is mounted at a path such as
+//! `/models/local/stories/infer` and invoked like any capability.
 
+pub mod local;
 mod mock;
 
 pub use mock::{MockFail, MockModel};

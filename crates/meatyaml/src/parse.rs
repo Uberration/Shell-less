@@ -728,4 +728,18 @@ flow:
         let syntax = compile(&format!("agent: {{ name: a }}\nflow: [ {{ read: /x }}\n  {SECRET}: ]")).unwrap_err();
         assert!(syntax.position.is_some());
     }
+
+    /// Frozen: graph outputs keep source order, and that order is part of
+    /// graph identity (a documented pre-release GraphId change).
+    #[test]
+    fn outputs_keep_source_order_in_identity() {
+        let src = |outputs: &str| {
+            format!("agent: {{ name: a }}\nflow:\n  - {{ id: x, compose: {{ literal: 1 }} }}\n  - {{ id: y, compose: {{ literal: 2 }} }}\noutputs:\n{outputs}")
+        };
+        let zy = compile(&src("  zeta: x\n  alpha: y\n")).unwrap();
+        let names: Vec<_> = zy.graph.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["zeta", "alpha"], "source order, not sorted");
+        let ay = compile(&src("  alpha: y\n  zeta: x\n")).unwrap();
+        assert_ne!(zy.graph.id, ay.graph.id);
+    }
 }

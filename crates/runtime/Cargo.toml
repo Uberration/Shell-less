@@ -10,4 +10,4 @@ meatyaml.workspace = true
 
 [dev-dependencies]
 capability.workspace = true
-model.workspace = true
+model = { workspace = true, features = ["fixtures"] }

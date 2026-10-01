@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 meatfs.workspace = true
 capability.workspace = true
+
+[features]
+# Deterministic fixture artifacts for other crates' tests.
+fixtures = []

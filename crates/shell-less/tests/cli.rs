@@ -179,6 +179,8 @@ fn examples_exit_as_expected() {
         ("escalate-declared", "run", 1),
         ("escalate", "check", 1),
         ("escalate", "run", 1),
+        ("story", "check", 0),
+        ("story", "run", 1), // no host artifacts: nothing mounted
     ];
     let mut seen: Vec<String> = std::fs::read_dir(examples)
         .unwrap()
@@ -207,4 +209,91 @@ fn examples_exit_as_expected() {
 fn usage_errors_exit_2() {
     assert_eq!(shell_less(&[]).code, 2);
     assert_eq!(shell_less(&["run", "--capture", "everything", "x"]).code, 2);
+}
+
+// ── M5: host-supplied model artifacts ───────────────────────────────────────
+
+const STORY: &str = r#"
+agent: { name: storyteller }
+authority:
+  - { path: /models/local/stories/infer, rights: [invoke] }
+  - { path: /state/story, rights: [write] }
+flow:
+  - id: infer
+    invoke:
+      path: /models/local/stories/infer
+      input: { messages: [{ role: user, content: hello world }], parameters: { max_tokens: 5 } }
+  - id: store
+    write: { path: /state/story, from: infer }
+outputs:
+  story: store
+"#;
+
+/// Fixture artifacts written to scratch files; returns their paths.
+fn fixture_artifacts(tag: &str, checkpoint: &[u8]) -> (String, String) {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let (c, t) = (dir.join(format!("{tag}-checkpoint.bin")), dir.join(format!("{tag}-tokenizer.bin")));
+    std::fs::write(&c, checkpoint).unwrap();
+    std::fs::write(&t, model::local::fixture::tokenizer()).unwrap();
+    (c.to_str().unwrap().to_owned(), t.to_str().unwrap().to_owned())
+}
+
+fn good_checkpoint() -> Vec<u8> {
+    model::local::fixture::checkpoint(model::local::fixture::tiny_spec())
+}
+
+#[test]
+fn host_mounts_validated_local_model() {
+    let (c, t) = fixture_artifacts("good", &good_checkpoint());
+    let out = on_source("story.meat.yaml", STORY, "run", &["--checkpoint", &c, "--tokenizer", &t, "--show-outputs"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert!(
+        out.stdout
+            .contains("declared Effectful + Nondeterministic  shell-less/llama2c-v0-f32-scalar@1;checkpoint=fnv1a64:"),
+        "{}",
+        out.stdout
+    );
+    let outputs = out.stdout.split("── outputs").nth(1).unwrap();
+    assert!(outputs.contains(r#""input_tokens":3"#), "{outputs}");
+    assert!(!out.all().contains(&c) && !out.all().contains(&t), "no host path in diagnostics or metadata");
+}
+
+#[test]
+fn startup_failures_omit_host_paths() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(SENTINEL);
+    let missing = dir.join("stories15M.bin");
+    let missing = missing.to_str().unwrap();
+    let out = on_source("story-missing.meat.yaml", STORY, "run", &["--checkpoint", missing, "--tokenizer", missing]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("Checkpoint: io error (NotFound) (file <path>)"), "{}", out.stderr);
+    assert!(!leaks(&out.all()), "{}", out.all());
+    let out = on_source(
+        "story-missing-inline.meat.yaml",
+        STORY,
+        "run",
+        &["--checkpoint", missing, "--tokenizer", missing, "--capture", "inline"],
+    );
+    assert!(leaks(&out.stderr), "{}", out.stderr);
+}
+
+#[test]
+fn invalid_artifacts_fail_before_anything_is_mounted() {
+    let truncated = good_checkpoint();
+    let (c, t) = fixture_artifacts("truncated", &truncated[..truncated.len() - 4]);
+    let out = on_source("story-truncated.meat.yaml", STORY, "run", &["--checkpoint", &c, "--tokenizer", &t]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("Checkpoint: truncated"), "{}", out.stderr);
+    assert!(!out.stdout.contains("── receipt"), "nothing ran: {}", out.stdout);
+
+    // Without artifacts there is nothing at the model's path to invoke.
+    let out = on_source("story-unmounted.meat.yaml", STORY, "run", &[]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("load error Authority: Unbound"), "{}", out.stderr);
+}
+
+#[test]
+fn artifacts_come_as_a_pair() {
+    let (c, _) = fixture_artifacts("lonely", &good_checkpoint());
+    let out = on_source("story-lonely.meat.yaml", STORY, "run", &["--checkpoint", &c]);
+    assert_eq!(out.code, 2);
 }

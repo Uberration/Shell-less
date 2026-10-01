@@ -1,0 +1,39 @@
+# M5: completion through a host-mounted local model. Needs the host to start
+# with --checkpoint and --tokenizer; without them nothing is mounted at the
+# model's path and loading fails (Unbound).
+agent:
+  name: storyteller
+
+authority:
+  - path: /models/local/stories/infer
+    rights: [invoke]
+  - path: /state/story
+    rights: [write]
+
+flow:
+  - id: request
+    compose:
+      map:
+        messages:
+          list:
+            - map:
+                role: { literal: user }
+                content: { literal: Once upon a time }
+        parameters:
+          map:
+            max_tokens: { literal: 48 }
+
+  - id: infer
+    invoke:
+      path: /models/local/stories/infer
+      input:
+        from: request
+
+  - id: store
+    write:
+      path: /state/story
+      from: infer
+
+outputs:
+  story:
+    from: store
