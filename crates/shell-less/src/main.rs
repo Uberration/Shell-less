@@ -15,9 +15,9 @@
 //! diagnostic content.
 
 use capability::builtin::{Echo, Fail, Upper};
-use meatfs::{EventKind, GrantSet, MeatFs, NodeKind, Path, Policy, Rights, Seed, Target, Value};
+use meatfs::{EventKind, GrantSet, MeatFs, NodeKind, Path, Policy, Rights, Seed, Value};
 use meatyaml::{EdgeKind, Op, Program, Selector, ValueExpr};
-use runtime::{CapturedValue, ContentCapture, ExecutionReceipt, Limits, ResolvedTarget};
+use runtime::{CapturedValue, ContentCapture, ExecutionReceipt, Limits, RecordedTarget, ResolvedTarget};
 use std::fmt::Display;
 use std::process::ExitCode;
 
@@ -124,7 +124,7 @@ fn drive(args: &Args) -> Result<bool, String> {
     let show = Show(args.capture);
     // The file name is a host argument, not program content.
     let source = std::fs::read_to_string(&args.file).map_err(|e| format!("{}: {e}", args.file))?;
-    let program = meatyaml::compile(&source).map_err(|e| e.render(show.reveal()))?;
+    let program = meatyaml::compile_with(&source, args.capture).map_err(|e| e.render())?;
     section("MEAT IR");
     print_ir(&program, show);
     if args.command == "check" {
@@ -132,9 +132,9 @@ fn drive(args: &Args) -> Result<bool, String> {
     }
 
     let host_error = |e: meatfs::Error| format!("host: {}", e.redacted());
-    let (fs, host) = boot(args.seed.map_or_else(Seed::entropy, Seed::fixed)).map_err(host_error)?;
+    let (fs, host) = boot(args.seed.map_or_else(Seed::entropy, Seed::fixed), args.capture).map_err(host_error)?;
     let policy = policy().map_err(host_error)?;
-    let loaded = runtime::load(&fs, &policy, Limits::default(), &program).map_err(|e| e.render(show.reveal()))?;
+    let loaded = runtime::load(&fs, &policy, Limits::default(), args.capture, &program).map_err(|e| e.render())?;
 
     section("resolved");
     for (node, resolved) in loaded.graph().nodes.iter().zip(loaded.nodes()) {
@@ -180,9 +180,11 @@ fn drive(args: &Args) -> Result<bool, String> {
 }
 
 /// The host namespace: native capabilities, mock models and seed memory.
-fn boot(seed: Seed) -> meatfs::Result<(MeatFs, GrantSet)> {
+/// The journal records under the same capture policy as everything else.
+fn boot(seed: Seed, capture: ContentCapture) -> meatfs::Result<(MeatFs, GrantSet)> {
     let (fs, host) = MeatFs::genesis(seed);
     let root = root(&host);
+    fs.set_journal_capture(&root, capture)?;
     capability::mount(&fs, &root, &Path::parse("/tools/echo")?, Echo)?;
     capability::mount(&fs, &root, &Path::parse("/tools/text/upper")?, Upper)?;
     capability::mount(&fs, &root, &Path::parse("/tools/test/fail")?, Fail)?;
@@ -274,9 +276,9 @@ fn print_receipt(program: &Program, receipt: &ExecutionReceipt, show: Show) {
     println!("  capture    {:?}", receipt.capture);
     for g in &receipt.grants {
         let target = match &g.target {
-            Target::Object(o) => o.short(),
-            Target::Name(p) => format!("name {}", show.path(p)),
-            Target::Namespace(p) => format!("namespace {}", show.path(p)),
+            RecordedTarget::Object(o) => o.short(),
+            RecordedTarget::Name(name) => format!("name {}", show.captured(name)),
+            RecordedTarget::Namespace(name) => format!("namespace {}", show.captured(name)),
         };
         println!("  grant      {}  {target} [{}]", g.grant.short(), g.rights);
     }
@@ -313,14 +315,14 @@ fn print_receipt(program: &Program, receipt: &ExecutionReceipt, show: Show) {
     if let Some(e) = &receipt.error {
         println!("  error      {e}");
     }
-    for (name, value) in &receipt.outputs {
-        println!("  output     {} = {}", show.name(name), show.captured(value));
+    for o in &receipt.outputs {
+        println!("  output     #{} {} ← {} = {}", o.index, show.captured(&o.name), o.source, show.captured(&o.value));
     }
 }
 
 fn kind(kind: &EventKind, show: Show) -> String {
     match kind {
-        EventKind::Bound(path) => format!("bound {}", show.path(path)),
+        EventKind::Bound(name) => format!("bound {}", show.captured(name)),
         EventKind::Read { version } => format!("read v{version}"),
         EventKind::Staged => "staged".to_owned(),
         EventKind::Written { version } => format!("written v{version}"),

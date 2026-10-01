@@ -2,15 +2,36 @@ use crate::{
     Edge, EdgeKind, Error, ErrorKind, Graph, GraphOutput, InvokeOp, Node, Op, Program, ReadOp, Selector, Use,
     ValueExpr, WriteOp,
 };
-use meatfs::{NodeId, Path, Rights, Value};
-use std::collections::{BTreeMap, HashMap};
+use meatfs::{ContentCapture, NodeId, Path, Rights, Value};
+use std::collections::HashMap;
 use yaml_rust2::{Yaml, YamlLoader};
 
-type Result<T> = std::result::Result<T, Error>;
+/// A compile failure before capture is applied. Internal only: it becomes
+/// an [`Error`] record, under the host's capture policy, at the boundary.
+struct Raw {
+    kind: ErrorKind,
+    at: Loc,
+    position: Option<(usize, usize)>,
+    detail: String,
+}
+
+impl Raw {
+    fn record(self, capture: ContentCapture) -> Error {
+        let location = match capture {
+            ContentCapture::Omit => self.at.safe,
+            ContentCapture::Inline => self.at.full,
+        };
+        let detail = self.detail;
+        Error { kind: self.kind, location, position: self.position, detail: capture.text(|| detail) }
+    }
+}
+
+type Result<T> = std::result::Result<T, Raw>;
 
 /// A location within a program, kept in two forms: `full`, and `safe`, in
 /// which every source-controlled segment (map keys, unknown operation
-/// names, output names) is replaced by a fixed placeholder.
+/// names, output names) is replaced by its position in the enclosing map,
+/// `#i`, so distinct segments stay distinct.
 #[derive(Debug, Clone, Default)]
 struct Loc {
     full: String,
@@ -33,34 +54,43 @@ impl Loc {
         self.push(&i, &i, true)
     }
 
-    /// A segment taken from the source text.
-    fn name(&self, name: &str) -> Loc {
-        self.push(name, "<name>", false)
+    /// A key taken from the source text, at `index` in its map.
+    fn name(&self, name: &str, index: usize) -> Loc {
+        self.push(name, &format!("#{index}"), false)
     }
 
     /// An operation or constructor name: fixed if the grammar knows it.
-    fn keyword(&self, word: &str, known: &[&'static str]) -> Loc {
+    fn keyword(&self, word: &str, index: usize, known: &[&'static str]) -> Loc {
         match known.iter().find(|k| **k == word) {
             Some(k) => self.field(k),
-            None => self.name(word),
+            None => self.name(word, index),
         }
     }
 }
 
 fn err<T>(kind: ErrorKind, at: &Loc, detail: impl Into<String>) -> Result<T> {
-    Err(Error { kind, at: at.full.clone(), at_redacted: at.safe.clone(), position: None, detail: detail.into() })
+    Err(Raw { kind, at: at.clone(), position: None, detail: detail.into() })
 }
 
 const OPERATIONS: &[&str] = &["read", "write", "invoke", "compose"];
 const CONSTRUCTORS: &[&str] = &["literal", "select", "map", "list"];
 
-/// Compile MEATYAML source into a validated [`Program`].
-pub fn compile(source: &str) -> Result<Program> {
+/// Compile MEATYAML source into a validated [`Program`]. Error records
+/// retain no source text; see [`compile_with`].
+pub fn compile(source: &str) -> std::result::Result<Program, Error> {
+    compile_with(source, ContentCapture::Omit)
+}
+
+/// Compile, recording any error under the host's `capture` policy.
+pub fn compile_with(source: &str, capture: ContentCapture) -> std::result::Result<Program, Error> {
+    compile_raw(source).map_err(|raw| raw.record(capture))
+}
+
+fn compile_raw(source: &str) -> Result<Program> {
     let root = Loc::default();
-    let docs = YamlLoader::load_from_str(source).map_err(|e| Error {
+    let docs = YamlLoader::load_from_str(source).map_err(|e| Raw {
         kind: ErrorKind::Syntax,
-        at: String::new(),
-        at_redacted: String::new(),
+        at: Loc::default(),
         position: Some((e.marker().line(), e.marker().col() + 1)),
         detail: e.info().to_owned(),
     })?;
@@ -170,7 +200,7 @@ impl Compiler {
         let mut step_map = Map::of(step, at)?;
         let label = step_map.optional("id").map(|y| text(y, &at.field("id"))).transpose()?;
         let after = step_map.optional("after");
-        let [(op_name, body)] = step_map.entries.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()[..] else {
+        let [(op_index, op_name, body)] = step_map.entries[..] else {
             return err(ErrorKind::Shape, at, "a step has exactly one operation (plus optional `id` and `after`)");
         };
         let id = NodeId(self.nodes.len() as u32);
@@ -183,7 +213,7 @@ impl Compiler {
             }
             Some(y) => vec![self.reference(y, &after_at, previous)?],
         };
-        let at = at.keyword(op_name, OPERATIONS);
+        let at = at.keyword(op_name, op_index, OPERATIONS);
 
         let (op, data_sources) = if op_name == "compose" {
             let expr = self.expr(body, &at, previous)?;
@@ -296,10 +326,10 @@ impl Compiler {
     /// One composition expression: a map with exactly one constructor key.
     fn expr(&self, yaml: &Yaml, at: &Loc, previous: Option<NodeId>) -> Result<ValueExpr> {
         let map = Map::of(yaml, at)?;
-        let [(constructor, body)] = map.entries.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()[..] else {
+        let [(index, constructor, body)] = map.entries[..] else {
             return err(ErrorKind::Shape, at, "an expression has exactly one of `literal`, `select`, `map`, `list`");
         };
-        let at = at.keyword(constructor, CONSTRUCTORS);
+        let at = at.keyword(constructor, index, CONSTRUCTORS);
         match constructor {
             "literal" => Ok(ValueExpr::Literal(value(body, &at)?)),
             "select" => {
@@ -331,7 +361,7 @@ impl Compiler {
                 let fields = fields
                     .entries
                     .iter()
-                    .map(|(k, v)| Ok(((*k).to_owned(), self.expr(v, &at.name(k), previous)?)))
+                    .map(|&(i, k, v)| Ok((k.to_owned(), self.expr(v, &at.name(k, i), previous)?)))
                     .collect::<Result<_>>()?;
                 Ok(ValueExpr::Map(fields))
             }
@@ -363,8 +393,8 @@ impl Compiler {
         let map = Map::of(yaml, at)?;
         map.entries
             .iter()
-            .map(|(name, spec)| {
-                let at = at.name(name);
+            .map(|&(index, name, spec)| {
+                let at = at.name(name, index);
                 let source = match spec {
                     Yaml::Hash(_) => {
                         let mut spec = Map::of(spec, &at)?;
@@ -375,16 +405,17 @@ impl Compiler {
                     other => other,
                 };
                 let source = self.reference(source, &at.field("from"), None)?;
-                Ok(GraphOutput { name: (*name).to_owned(), source })
+                Ok(GraphOutput { name: name.to_owned(), source })
             })
             .collect()
     }
 }
 
-/// A YAML map whose keys must all be consumed.
+/// A YAML map whose keys must all be consumed. Entries keep their position
+/// in the source, which locates source-controlled keys without quoting them.
 struct Map<'y> {
     at: Loc,
-    entries: BTreeMap<&'y str, &'y Yaml>,
+    entries: Vec<(usize, &'y str, &'y Yaml)>,
 }
 
 impl<'y> Map<'y> {
@@ -392,10 +423,10 @@ impl<'y> Map<'y> {
         let Yaml::Hash(hash) = yaml else {
             return err(ErrorKind::Shape, at, "expected a map");
         };
-        let mut entries = BTreeMap::new();
-        for (k, v) in hash {
+        let mut entries = Vec::with_capacity(hash.len());
+        for (i, (k, v)) in hash.iter().enumerate() {
             match k.as_str() {
-                Some(k) => entries.insert(k, v),
+                Some(k) => entries.push((i, k, v)),
                 None => return err(ErrorKind::Shape, at, "map keys must be strings"),
             };
         }
@@ -403,21 +434,22 @@ impl<'y> Map<'y> {
     }
 
     fn optional(&mut self, key: &str) -> Option<&'y Yaml> {
-        self.entries.remove(key)
+        let i = self.entries.iter().position(|&(_, k, _)| k == key)?;
+        Some(self.entries.remove(i).2)
     }
 
     /// `key` is always a grammar label, so it may appear in the location.
     fn require(&mut self, key: &'static str) -> Result<&'y Yaml> {
-        match self.entries.remove(key) {
+        match self.optional(key) {
             Some(v) => Ok(v),
             None => err(ErrorKind::MissingKey, &self.at.field(key), format!("missing `{key}`")),
         }
     }
 
     fn finish(self) -> Result<()> {
-        match self.entries.keys().next() {
+        match self.entries.first() {
             None => Ok(()),
-            Some(key) => err(ErrorKind::UnknownKey, &self.at.name(key), format!("unknown key `{key}`")),
+            Some(&(i, key, _)) => err(ErrorKind::UnknownKey, &self.at.name(key, i), format!("unknown key `{key}`")),
         }
     }
 }
@@ -450,7 +482,7 @@ fn value(yaml: &Yaml, at: &Loc) -> Result<Value> {
             Value::Map(
                 map.entries
                     .iter()
-                    .map(|(k, v)| Ok(((*k).to_owned(), value(v, &at.name(k))?)))
+                    .map(|&(i, k, v)| Ok((k.to_owned(), value(v, &at.name(k, i))?)))
                     .collect::<Result<_>>()?,
             )
         }
@@ -461,6 +493,11 @@ fn value(yaml: &Yaml, at: &Loc) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The location an error records when the host captures inline.
+    fn located(src: &str) -> String {
+        compile_with(src, ContentCapture::Inline).unwrap_err().location
+    }
 
     const ECHO: &str = include_str!("../../../examples/echo.meat.yaml");
     const BUTCHER: &str = include_str!("../../../examples/butcher.meat.yaml");
@@ -503,7 +540,7 @@ mod tests {
         // the four nodes touch disjoint state.
         assert_eq!(edges(&program), vec![(0, 1, EdgeKind::Data), (0, 2, EdgeKind::Data), (1, 3, EdgeKind::Data)]);
         let names: Vec<_> = program.graph.outputs.iter().map(|o| (o.name.as_str(), o.source.0)).collect();
-        assert_eq!(names, vec![("echo", 3), ("upper", 2)]);
+        assert_eq!(names, vec![("upper", 2), ("echo", 3)], "source order");
     }
 
     #[test]
@@ -562,14 +599,13 @@ flow:
 
     #[test]
     fn rejects_undeclared_authority() {
-        let e = compile(&ECHO.replace("rights: [write]", "rights: [read]")).unwrap_err();
-        assert_eq!(e.at, "flow[1].write");
+        assert_eq!(located(&ECHO.replace("rights: [write]", "rights: [read]")), "flow[1].write");
         let e = compile(&BUTCHER.replace(
             "      input:\n        from: upper",
             "      from: upper\n      uses: [{ path: /memory, rights: [read] }]",
         ))
         .unwrap_err();
-        assert_eq!(e.at, "flow[1].invoke");
+        assert_eq!(e.location, "flow[1].invoke");
     }
 
     #[test]
@@ -586,7 +622,7 @@ flow:
             (ECHO.replace("from: store", "from: ghost"), "outputs.result.from"),
         ];
         for (src, at) in cases {
-            assert_eq!(compile(&src).unwrap_err().at, at, "{src}");
+            assert_eq!(located(&src), at, "{src}");
         }
     }
 
@@ -658,7 +694,7 @@ flow:
             ),
         ];
         for (src, at) in cases {
-            assert_eq!(compile(&src).unwrap_err().at, at, "{src}");
+            assert_eq!(located(&src), at, "{src}");
         }
     }
 
@@ -678,12 +714,16 @@ flow:
             (format!("agent: {{ name: a }}\nflow:\n  - {{ id: x, compose: {{ literal: 1 }} }}\n  - {{ compose: {{ map: {{ {SECRET}: {{ select: {{ from: x, path: [-1] }} }} }} }} }}"), ErrorKind::InvalidValue),
         ];
         for (src, kind) in cases {
+            // Omit: the record itself holds no source text, in any field.
             let e = compile(&src).unwrap_err();
             assert_eq!(e.kind, kind, "{src}");
-            let redacted = e.render(false);
-            assert!(!redacted.contains(SECRET) && !e.at_redacted.contains(SECRET), "{redacted}");
-            let revealing = !matches!(kind, ErrorKind::Syntax | ErrorKind::InvalidValue);
-            assert!(e.render(true).contains(SECRET) || !revealing, "{}", e.render(true));
+            assert_eq!(e.detail, None);
+            assert!(!format!("{e:?}").contains(SECRET), "{e:?}");
+            // Inline: the host chose to retain it.
+            let revealed = compile_with(&src, ContentCapture::Inline).unwrap_err();
+            assert!(revealed.detail.is_some());
+            let revealing = !matches!(kind, ErrorKind::Syntax);
+            assert!(format!("{revealed:?}").contains(SECRET) || !revealing, "{revealed:?}");
         }
         let syntax = compile(&format!("agent: {{ name: a }}\nflow: [ {{ read: /x }}\n  {SECRET}: ]")).unwrap_err();
         assert!(syntax.position.is_some());

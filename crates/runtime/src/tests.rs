@@ -67,7 +67,7 @@ fn snapshot(fs: &MeatFs, host: &GrantSet) -> Vec<(Path, ObjectId, Option<Value>)
 
 fn outcome(fs: &MeatFs, src: &str, capture: ContentCapture) -> Result<ExecutionOutcome, LoadError> {
     let program = meatyaml::compile(src).unwrap();
-    Ok(execute(fs, &load(fs, &policy(), Limits::default(), &program)?, capture))
+    Ok(execute(fs, &load(fs, &policy(), Limits::default(), capture, &program)?, capture))
 }
 
 /// Run with inline capture, for tests that inspect payloads in the receipt.
@@ -83,7 +83,14 @@ fn inline(captured: &Option<CapturedValue>) -> &Value {
 }
 
 fn inlined(receipt: &ExecutionReceipt) -> BTreeMap<String, Value> {
-    receipt.outputs.iter().map(|(k, v)| (k.clone(), inline(&Some(v.clone())).clone())).collect()
+    receipt
+        .outputs
+        .iter()
+        .map(|o| {
+            let name = inline(&Some(o.name.clone())).as_text().unwrap().to_owned();
+            (name, inline(&Some(o.value.clone())).clone())
+        })
+        .collect()
 }
 
 fn text(s: &str) -> Value {
@@ -151,9 +158,10 @@ fn failure_rolls_back_and_blocks() {
 fn loading_is_observational() {
     let (fs, host) = boot(1);
     let before = snapshot(&fs, &host);
-    load(&fs, &policy(), Limits::default(), &meatyaml::compile(BUTCHER).unwrap()).unwrap();
-    let denied = load(&fs, &Policy::default(), Limits::default(), &meatyaml::compile(BUTCHER).unwrap());
-    assert!(matches!(denied, Err(LoadError::Authority(meatfs::Error::PolicyDenied { .. }))));
+    load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &meatyaml::compile(BUTCHER).unwrap()).unwrap();
+    let denied =
+        load(&fs, &Policy::default(), Limits::default(), ContentCapture::Omit, &meatyaml::compile(BUTCHER).unwrap());
+    assert!(matches!(denied, Err(LoadError::Authority { kind: "PolicyDenied", detail: None, .. })));
     assert_eq!(snapshot(&fs, &host), before);
 }
 
@@ -182,8 +190,12 @@ fn scheduling_follows_edges_not_node_ids() {
         vec![],
     );
     let program = Program { agent: "a".into(), authority: vec![], graph };
-    let receipt =
-        execute(&fs, &load(&fs, &policy(), Limits::default(), &program).unwrap(), ContentCapture::Inline).receipt;
+    let receipt = execute(
+        &fs,
+        &load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &program).unwrap(),
+        ContentCapture::Inline,
+    )
+    .receipt;
     assert_eq!(receipt.schedule, vec![NodeId(1), NodeId(0)]);
     let x = fs.resolve(&p("/state/x")).unwrap();
     assert_eq!(fs.read(&root(&host), x).unwrap(), Value::Int(0));
@@ -239,10 +251,9 @@ flow:
 fn escalation_fails_at_policy() {
     let (fs, _) = boot(1);
     let e = run(&fs, include_str!("../../../examples/escalate-declared.meat.yaml")).err().unwrap();
-    assert_eq!(
-        e,
-        LoadError::Authority(meatfs::Error::PolicyDenied { path: p("/memory/context"), rights: Rights::WRITE })
-    );
+    let LoadError::Authority { kind, summary, detail } = e else { panic!("expected an authority failure") };
+    assert_eq!((kind, summary.as_str()), ("PolicyDenied", "PolicyDenied path=<omitted> rights=write"));
+    assert!(detail.unwrap().starts_with("/memory/context:"), "run() captures inline");
 }
 
 #[test]
@@ -261,10 +272,10 @@ fn rejects_structurally_invalid_ir() {
 fn retired_graphs_cannot_run() {
     let (fs, _) = boot(1);
     let program = meatyaml::compile(ECHO).unwrap();
-    let loaded = load(&fs, &policy(), Limits::default(), &program).unwrap();
+    let loaded = load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &program).unwrap();
     let grant = loaded.nodes()[0].grant;
     loaded.retire(&fs);
-    let again = load(&fs, &policy(), Limits::default(), &program).unwrap();
+    let again = load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &program).unwrap();
     assert_ne!(again.nodes()[0].grant, grant);
     assert!(execute(&fs, &again, ContentCapture::Inline).receipt.succeeded());
 }
@@ -298,7 +309,7 @@ fn model_is_an_ordinary_capability() {
     assert_eq!(infer.object, Some(model));
     assert!(infer.uses.is_empty());
     let grant = receipt.grants.iter().find(|g| Some(g.grant) == infer.grant).unwrap();
-    assert_eq!((&grant.target, grant.rights), (&Target::Object(model), Rights::INVOKE));
+    assert_eq!((&grant.target, grant.rights), (&RecordedTarget::Object(model), Rights::INVOKE));
 
     // Provenance: input, declared properties and implementation.
     let meta = infer.declared.clone().unwrap();
@@ -340,8 +351,12 @@ fn model_branch_is_independent_of_tool_branch() {
     let edges: Vec<_> = program.graph.edges.iter().map(|e| (e.from.0, e.to.0, e.kind)).collect();
     assert_eq!(edges, vec![(0, 2, EdgeKind::Data), (1, 3, EdgeKind::Data)]);
 
-    let receipt =
-        execute(&fs, &load(&fs, &policy(), Limits::default(), &program).unwrap(), ContentCapture::Inline).receipt;
+    let receipt = execute(
+        &fs,
+        &load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &program).unwrap(),
+        ContentCapture::Inline,
+    )
+    .receipt;
     assert!(receipt.succeeded());
     assert_eq!(inlined(&receipt)["tool"], text("MEAT"));
     assert_eq!(inlined(&receipt)["model"].get("message"), Some(&message("assistant", "MEAT")));
@@ -462,12 +477,17 @@ fn composition_is_bounded_by_host_limits() {
     let (fs, _) = boot(1);
     let program = meatyaml::compile(COMPOSER).unwrap();
     let shallow = Limits { max_depth: 2, ..Limits::default() };
-    assert!(matches!(load(&fs, &policy(), shallow, &program), Err(LoadError::LimitExceeded { .. })));
+    assert!(matches!(
+        load(&fs, &policy(), shallow, ContentCapture::Omit, &program),
+        Err(LoadError::LimitExceeded { .. })
+    ));
     let few = Limits { max_exprs: 3, ..Limits::default() };
-    assert!(matches!(load(&fs, &policy(), few, &program), Err(LoadError::LimitExceeded { .. })));
+    assert!(matches!(load(&fs, &policy(), few, ContentCapture::Omit, &program), Err(LoadError::LimitExceeded { .. })));
 
     let tiny = Limits { max_value_size: 8, ..Limits::default() };
-    let receipt = execute(&fs, &load(&fs, &policy(), tiny, &program).unwrap(), ContentCapture::Omit).receipt;
+    let receipt =
+        execute(&fs, &load(&fs, &policy(), tiny, ContentCapture::Omit, &program).unwrap(), ContentCapture::Omit)
+            .receipt;
     assert_eq!(receipt.error.unwrap().kind, ExecutionErrorKind::LimitExceeded);
 }
 
@@ -524,7 +544,11 @@ fn default_receipts_omit_content() {
             // The explicit result channel still carries the real value.
             let answer = outcome.outputs["answer"].get("message").unwrap();
             assert_eq!(answer.get("content"), Some(&Value::from(SENTINEL.to_uppercase())));
-            assert_eq!(receipt.outputs["answer"], CapturedValue::Omitted);
+            assert_eq!(receipt.outputs.len(), 1);
+            assert_eq!(
+                (&receipt.outputs[0].name, &receipt.outputs[0].value),
+                (&CapturedValue::Omitted, &CapturedValue::Omitted)
+            );
         }
     }
 }
@@ -544,7 +568,10 @@ fn only_the_host_can_enable_inline_capture() {
     let (fs, _) = boot(5);
     let src = THINKER.replace("content: meat", "content: \"capture: inline\"");
     let receipt = outcome(&fs, &src, ContentCapture::Omit).unwrap().receipt;
-    assert_eq!(receipt.outputs["answer"], CapturedValue::Omitted);
+    assert_eq!(
+        (&receipt.outputs[0].name, &receipt.outputs[0].value),
+        (&CapturedValue::Omitted, &CapturedValue::Omitted)
+    );
     assert_eq!(receipt.nodes[0].output, Some(CapturedValue::Omitted));
 }
 
@@ -593,7 +620,7 @@ flow:
 "#;
     let program = meatyaml::compile(src).unwrap();
     assert!(program.graph.edges.is_empty(), "disjoint MeatFS footprints: no IR edges");
-    let loaded = load(&fs, &policy(), Limits::default(), &program).unwrap();
+    let loaded = load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &program).unwrap();
     // The two declared-effectful invocations are chained; the pure one is not.
     assert_eq!(loaded.derived_order(), &[(NodeId(0), NodeId(2))]);
     let receipt = execute(&fs, &loaded, ContentCapture::Omit).receipt;
@@ -624,7 +651,8 @@ flow:
   - write: { path: /state/other, value: staged }
 outputs: { count: count }
 "#;
-    let loaded = load(&fs, &policy(), Limits::default(), &meatyaml::compile(src).unwrap()).unwrap();
+    let loaded =
+        load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &meatyaml::compile(src).unwrap()).unwrap();
 
     // Immediately before the execution commits, the host commits a different
     // value to /state/shared through its own, genuine MeatFS transaction.
@@ -674,7 +702,8 @@ flow:
   - invoke: { path: /tools/echo, input: { text: x } }
   - invoke: { path: /tools/test/counter, input: null }
 "#;
-    let loaded = load(&fs, &policy(), Limits::default(), &meatyaml::compile(src).unwrap()).unwrap();
+    let loaded =
+        load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &meatyaml::compile(src).unwrap()).unwrap();
     assert_eq!(loaded.nodes()[0].declared, None);
     assert_eq!(loaded.derived_order(), &[(NodeId(0), NodeId(2))], "unknown is chained; the pure echo is not");
 }
@@ -703,7 +732,7 @@ fn explicit_order_survives_against_node_id_order() {
         vec![],
     );
     let program = Program { agent: "a".into(), authority: vec![], graph };
-    let loaded = load(&fs, &policy(), Limits::default(), &program).unwrap();
+    let loaded = load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &program).unwrap();
     // Topological order n1, n2, n0: chaining adds n1 → n2; n2 → n0 already holds.
     assert_eq!(loaded.derived_order(), &[(NodeId(1), NodeId(2))]);
     let receipt = execute(&fs, &loaded, ContentCapture::Inline).receipt;
@@ -742,7 +771,8 @@ fn execution_uses_the_declaration_scheduling_used() {
     let fickle = Fickle { effectful: effectful.clone(), calls: calls.clone() };
     capability::mount(&fs, &root(&host), &p("/tools/test/fickle"), fickle).unwrap();
     let src = "agent: { name: a }\nauthority: [{ path: /tools, rights: [invoke] }]\nflow:\n  - invoke: { path: /tools/test/fickle, input: 1 }\n";
-    let loaded = load(&fs, &policy(), Limits::default(), &meatyaml::compile(src).unwrap()).unwrap();
+    let loaded =
+        load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &meatyaml::compile(src).unwrap()).unwrap();
     assert_eq!(loaded.nodes()[0].declared.as_ref().unwrap().purity, Purity::Pure);
 
     effectful.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -762,8 +792,153 @@ fn load_errors_render_without_source_text() {
     let src = format!(
         "agent: {{ name: a }}\nauthority: [{{ path: /memory/{SENTINEL}, rights: [write] }}]\nflow:\n  - write: {{ path: /memory/{SENTINEL}, value: 1 }}\n"
     );
-    let e = load(&fs, &policy(), Limits::default(), &meatyaml::compile(&src).unwrap()).err().unwrap();
-    assert!(matches!(e, LoadError::Authority(meatfs::Error::PolicyDenied { .. })));
-    assert!(!leaks(&e.render(false)), "{}", e.render(false));
-    assert!(leaks(&e.render(true)));
+    let program = meatyaml::compile(&src).unwrap();
+    let omitted = load(&fs, &policy(), Limits::default(), ContentCapture::Omit, &program).err().unwrap();
+    assert!(matches!(omitted, LoadError::Authority { kind: "PolicyDenied", detail: None, .. }));
+    assert!(!leaks(&format!("{omitted:?}")), "the record itself holds no path: {omitted:?}");
+    let inline = load(&fs, &policy(), Limits::default(), ContentCapture::Inline, &program).err().unwrap();
+    assert!(leaks(&inline.render()));
+}
+
+// ── Record boundary: names in receipts and the journal are content ──────────
+
+/// A write to a previously unbound path; the sentinel appears only there.
+fn name_program(suffix: &str) -> String {
+    format!(
+        "agent: {{ name: a }}\nauthority: [{{ path: /state, rights: [write] }}]\nflow:\n  - id: store\n    write: {{ path: /state/{SENTINEL}{suffix}, value: 1 }}\noutputs: {{ result: store }}\n"
+    )
+}
+
+fn name_run(fs: &MeatFs, suffix: &str, capture: ContentCapture) -> (Loaded, ExecutionOutcome) {
+    let program = meatyaml::compile(&name_program(suffix)).unwrap();
+    let loaded = load(fs, &policy(), Limits::default(), capture, &program).unwrap();
+    let outcome = execute(fs, &loaded, capture);
+    (loaded, outcome)
+}
+
+fn bound_event(events: &[Event], object: ObjectId) -> Event {
+    events.iter().find(|e| e.object == object && matches!(e.kind, EventKind::Bound(_))).unwrap().clone()
+}
+
+/// Every public field of a receipt, inspected structurally: nothing inline.
+fn assert_retains_no_content(receipt: &ExecutionReceipt) {
+    assert_eq!(receipt.capture, ContentCapture::Omit);
+    for g in &receipt.grants {
+        assert!(!matches!(
+            g.target,
+            RecordedTarget::Name(CapturedValue::Inline(_)) | RecordedTarget::Namespace(CapturedValue::Inline(_))
+        ));
+    }
+    for n in &receipt.nodes {
+        assert!(
+            !matches!(n.input, Some(CapturedValue::Inline(_))) && !matches!(n.output, Some(CapturedValue::Inline(_)))
+        );
+        assert!(n.error.as_ref().is_none_or(|e| e.detail.is_none()));
+    }
+    for e in &receipt.events {
+        assert!(!matches!(e.kind, EventKind::Bound(CapturedValue::Inline(_))));
+    }
+    for o in &receipt.outputs {
+        assert_eq!((&o.name, &o.value), (&CapturedValue::Omitted, &CapturedValue::Omitted));
+    }
+    assert!(receipt.error.as_ref().is_none_or(|e| e.detail.is_none()));
+    assert!(!leaks(&format!("{receipt:?}")));
+}
+
+#[test]
+fn name_grant_record_omits_the_path_while_the_live_grant_authorizes() {
+    let (fs, host) = boot(1);
+    let (loaded, outcome) = name_run(&fs, "", ContentCapture::Omit);
+    let path = p(&format!("/state/{SENTINEL}"));
+
+    // Operational: the live grant keeps the real name and authorizes the write.
+    assert_eq!(loaded.grants().issued(0).unwrap().target(), &Target::Name(path.clone()));
+    assert!(outcome.receipt.succeeded());
+    let created = fs.resolve(&path).expect("the write created the name");
+    assert_eq!(fs.read(&root(&host), created).unwrap(), Value::Int(1));
+
+    // Recorded: the receipt's grant target holds no copy of the name.
+    let grant = &outcome.receipt.grants[0];
+    assert_eq!(grant.target, RecordedTarget::Name(CapturedValue::Omitted));
+    assert_eq!(grant.grant, loaded.grants().issued(0).unwrap().id());
+}
+
+#[test]
+fn binding_event_records_identity_and_provenance_without_the_path() {
+    let (fs, host) = boot(1);
+    let (_, outcome) = name_run(&fs, "", ContentCapture::Omit);
+    let receipt = &outcome.receipt;
+    let created = fs.resolve(&p(&format!("/state/{SENTINEL}"))).unwrap();
+
+    for events in
+        [fs.journal(&root(&host), &Path::root()).unwrap(), fs.journal_retained(&root(&host), &Path::root()).unwrap()]
+    {
+        let bound = bound_event(&events, created);
+        assert_eq!(bound.kind, EventKind::Bound(CapturedValue::Omitted));
+        assert_eq!(bound.cause.unwrap(), Cause { execution: receipt.execution, node: NodeId(0) });
+        assert_eq!((bound.principal, bound.grant), (receipt.principal, Some(receipt.grants[0].grant)));
+        assert!(!leaks(&format!("{events:?}")), "not even the raw history retained it");
+    }
+}
+
+#[test]
+fn omitted_receipts_retain_no_content_in_any_field() {
+    let (fs, host) = boot(1);
+    capability::mount(&fs, &root(&host), &p("/tools/test/leaky"), Leaky).unwrap();
+    for src in [name_program(""), sentinel_program(false), sentinel_program(true)] {
+        let receipt = outcome(&fs, &src, ContentCapture::Omit).unwrap().receipt;
+        assert_retains_no_content(&receipt);
+    }
+}
+
+#[test]
+fn inline_capture_retains_names_and_never_reconstructs_omitted_ones() {
+    let (fs, host) = boot(1);
+    // First run: journal and receipt under the default, Omit.
+    let (_, first) = name_run(&fs, "-first", ContentCapture::Omit);
+    let first_object = fs.resolve(&p(&format!("/state/{SENTINEL}-first"))).unwrap();
+
+    // The host opts in: journal and receipt inline.
+    fs.set_journal_capture(&root(&host), ContentCapture::Inline).unwrap();
+    let (_, second) = name_run(&fs, "-second", ContentCapture::Inline);
+    let second_path = format!("/state/{SENTINEL}-second");
+    let second_object = fs.resolve(&p(&second_path)).unwrap();
+    let receipt = &second.receipt;
+    assert_eq!(
+        receipt.grants[0].target,
+        RecordedTarget::Name(CapturedValue::Inline(Value::from(second_path.as_str())))
+    );
+    assert_eq!(
+        bound_event(&receipt.events, second_object).kind,
+        EventKind::Bound(CapturedValue::Inline(Value::from(second_path.as_str())))
+    );
+    assert_eq!(receipt.outputs[0].name, CapturedValue::Inline(Value::from("result")));
+
+    // Neither the later policy nor an inline view brings back the first name.
+    let retained = fs.journal_retained(&root(&host), &Path::root()).unwrap();
+    assert_eq!(bound_event(&retained, first_object).kind, EventKind::Bound(CapturedValue::Omitted));
+    assert_retains_no_content(&first.receipt);
+}
+
+#[test]
+fn omitted_views_hide_inline_history_and_results_stay_exact() {
+    let (fs, host) = boot(1);
+    fs.set_journal_capture(&root(&host), ContentCapture::Inline).unwrap();
+    name_run(&fs, "-kept", ContentCapture::Inline);
+    fs.set_journal_capture(&root(&host), ContentCapture::Omit).unwrap();
+    let (_, later) = name_run(&fs, "-later", ContentCapture::Omit);
+
+    // The omitted view shows no content, including the earlier inline record.
+    let omitted = fs.journal(&root(&host), &Path::root()).unwrap();
+    assert!(omitted.iter().all(|e| !matches!(e.kind, EventKind::Bound(CapturedValue::Inline(_)))));
+    assert!(!leaks(&format!("{omitted:?}")));
+    // The raw history shows exactly what each record retained.
+    let retained = fs.journal_retained(&root(&host), &Path::root()).unwrap();
+    let kept = fs.resolve(&p(&format!("/state/{SENTINEL}-kept"))).unwrap();
+    let dropped = fs.resolve(&p(&format!("/state/{SENTINEL}-later"))).unwrap();
+    assert!(matches!(bound_event(&retained, kept).kind, EventKind::Bound(CapturedValue::Inline(_))));
+    assert_eq!(bound_event(&retained, dropped).kind, EventKind::Bound(CapturedValue::Omitted));
+    // The receipt for the later run is omitted; its real result is exact.
+    assert_retains_no_content(&later.receipt);
+    assert_eq!(later.outputs, BTreeMap::from([("result".to_owned(), Value::Int(1))]));
 }

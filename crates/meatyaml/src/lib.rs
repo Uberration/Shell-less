@@ -34,7 +34,7 @@ use meatfs::{AuthorityRequest, NodeId, Path, Rights, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub use parse::compile;
+pub use parse::{compile, compile_with};
 
 /// A compiled MEATYAML program: IR plus declared authority.
 #[derive(Debug, Clone, PartialEq)]
@@ -378,42 +378,42 @@ pub enum ErrorKind {
     MissingData,
 }
 
-/// A compile error. `kind`, `at_redacted` and `position` never contain
-/// source text; `at` and `detail` may, and are shown only when the host
-/// chooses to reveal content.
+/// A compile error record, made under the host's capture policy. Under
+/// `Omit` it holds no source text: `location` names source-controlled
+/// segments only by position (`#i`) and `detail` is `None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Error {
     pub kind: ErrorKind,
-    /// Location, e.g. `flow[2].compose.map.messages`. May quote source keys.
-    pub at: String,
-    /// The same location with every source-controlled segment replaced by
-    /// `<name>`.
-    pub at_redacted: String,
+    /// Structural location, e.g. `flow[2].compose.map.#0.select`. Under
+    /// `Inline`, source-controlled segments appear as written.
+    pub location: String,
     /// Line and column (both 1-based), where the YAML parser reports them.
     pub position: Option<(usize, usize)>,
-    /// Human-readable explanation. May quote source text.
-    pub detail: String,
+    /// Human-readable explanation, retained only under `Inline`.
+    pub detail: Option<String>,
 }
 
 impl Error {
-    /// Render for a diagnostic surface: with source text only if `reveal`.
-    pub fn render(&self, reveal: bool) -> String {
-        let at = if reveal { &self.at } else { &self.at_redacted };
+    /// Render the record. Shows exactly what the record retained.
+    pub fn render(&self) -> String {
         let mut out = format!("compile error kind={:?}", self.kind);
-        if !at.is_empty() {
-            out += &format!(" at={at}");
+        if !self.location.is_empty() {
+            out += &format!(" at={}", self.location);
         }
         if let Some((line, column)) = self.position {
             out += &format!(" line={line} column={column}");
         }
-        out += &if reveal { format!(" detail={}", self.detail) } else { " detail=<omitted>".to_owned() };
+        match &self.detail {
+            Some(detail) => out += &format!(" detail={detail}"),
+            None => out += " detail=<omitted>",
+        }
         out
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render(true))
+        f.write_str(&self.render())
     }
 }
 

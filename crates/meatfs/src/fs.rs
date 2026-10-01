@@ -1,6 +1,9 @@
 use crate::authority::{Access, AuthorityRequest, Cause, Grant, GrantSet, NodeGrant, NodeGrants, Policy, Target};
 use crate::id::IdGen;
-use crate::{AuthorityDomainId, Error, ExecutionId, GrantId, ObjectId, Path, PrincipalId, Result, Rights, Seed, Value};
+use crate::{
+    AuthorityDomainId, CapturedValue, ContentCapture, Error, ExecutionId, GrantId, ObjectId, Path, PrincipalId, Result,
+    Rights, Seed, Value,
+};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -162,7 +165,8 @@ pub struct Inspection {
 }
 
 /// One entry of the audit journal. The journal records attempts and their
-/// outcomes; it is never rolled back.
+/// outcomes; it is never rolled back. Any name an event carries is captured
+/// under the journal's recording policy at the moment it is recorded.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub seq: u64,
@@ -176,7 +180,8 @@ pub struct Event {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventKind {
-    Bound(Path),
+    /// A name was bound to the object. The name as the record retains it.
+    Bound(CapturedValue),
     Read {
         version: u64,
     },
@@ -193,7 +198,8 @@ pub enum EventKind {
     },
 }
 
-/// A live stream of events within a grant's target.
+/// A live stream of events within a grant's target, delivered as recorded
+/// (under the journal's recording policy at that moment).
 pub struct Subscription {
     rx: Receiver<Event>,
 }
@@ -247,8 +253,21 @@ impl Who {
 #[derive(Default)]
 struct Journal {
     seq: u64,
+    /// What new records may retain. Defaults to `Omit`.
+    capture: ContentCapture,
     events: Vec<Event>,
     subscribers: Vec<(Target, Sender<Event>)>,
+}
+
+impl Event {
+    /// This record as seen through `view`.
+    pub fn viewed(&self, view: ContentCapture) -> Event {
+        let kind = match &self.kind {
+            EventKind::Bound(name) => EventKind::Bound(name.viewed(view)),
+            other => other.clone(),
+        };
+        Event { kind, ..self.clone() }
+    }
 }
 
 struct State {
@@ -353,8 +372,21 @@ impl MeatFs {
     }
 
     fn record(&self, names: &BTreeSet<Path>, object: ObjectId, who: Who, kind: EventKind) {
+        self.record_with(names, object, who, |_| kind);
+    }
+
+    /// Record an event whose content depends on the recording policy in
+    /// force, decided under the same lock that appends it.
+    fn record_with(
+        &self,
+        names: &BTreeSet<Path>,
+        object: ObjectId,
+        who: Who,
+        kind: impl FnOnce(ContentCapture) -> EventKind,
+    ) {
         let mut journal = self.journal.lock().unwrap();
         journal.seq += 1;
+        let kind = kind(journal.capture);
         let event =
             Event { seq: journal.seq, object, principal: who.principal, grant: who.grant, cause: who.cause, kind };
         journal.subscribers.retain(|(target, tx)| !covers(target, object, names) || tx.send(event.clone()).is_ok());
@@ -441,7 +473,8 @@ impl MeatFs {
         bindable(&st.names, path)?;
         let object = st.ids.object();
         st.insert(object, path, body);
-        self.record(&st.objects[&object].names, object, Who::of(access), EventKind::Bound(path.clone()));
+        let names = &st.objects[&object].names;
+        self.record_with(names, object, Who::of(access), |capture| EventKind::Bound(capture.name(path)));
         Ok(object)
     }
 
@@ -565,29 +598,60 @@ impl MeatFs {
             .collect())
     }
 
-    /// The audit journal for every object bound beneath `prefix`.
-    pub fn journal(&self, access: &Access<'_>, prefix: &Path) -> Result<Vec<Event>> {
+    /// Set what journal records made from now on may retain. Records
+    /// already made keep exactly what they retained. Host authority only.
+    pub fn set_journal_capture(&self, access: &Access<'_>, capture: ContentCapture) -> Result<()> {
+        self.state.read().unwrap().verify_namespace(self.domain, access, &Path::root(), Rights::WRITE)?;
+        self.journal.lock().unwrap().capture = capture;
+        Ok(())
+    }
+
+    fn journal_view(&self, access: &Access<'_>, prefix: &Path, view: ContentCapture) -> Result<Vec<Event>> {
         let st = self.state.read().unwrap();
-        st.verify_namespace(self.domain, access, prefix, Rights::INSPECT)?;
+        let needed = match view {
+            ContentCapture::Omit => Rights::INSPECT,
+            ContentCapture::Inline => Rights::INSPECT | Rights::READ,
+        };
+        st.verify_namespace(self.domain, access, prefix, needed)?;
         let target = Target::Namespace(prefix.clone());
         let journal = self.journal.lock().unwrap();
         Ok(journal
             .events
             .iter()
             .filter(|e| covers(&target, e.object, st.objects.get(&e.object).map_or(NO_NAMES, |o| &o.names)))
-            .cloned()
+            .map(|e| e.viewed(view))
             .collect())
     }
 
-    /// Every event caused by the presented access's execution. A principal
-    /// may always see what its own execution did.
-    pub fn execution_events(&self, access: &Access<'_>) -> Result<Vec<Event>> {
+    /// The audit journal for every object bound beneath `prefix`, as an
+    /// omitted view: no record shows content, including records that were
+    /// retained inline.
+    pub fn journal(&self, access: &Access<'_>, prefix: &Path) -> Result<Vec<Event>> {
+        self.journal_view(access, prefix, ContentCapture::Omit)
+    }
+
+    /// The raw audit history beneath `prefix`: every record exactly as it
+    /// was retained. Shows inline content only where the record kept it;
+    /// never reconstructs what a record omitted. Requires read as well as
+    /// inspect authority over the prefix.
+    pub fn journal_retained(&self, access: &Access<'_>, prefix: &Path) -> Result<Vec<Event>> {
+        self.journal_view(access, prefix, ContentCapture::Inline)
+    }
+
+    /// Every event caused by the presented access's execution, seen through
+    /// `view`. A principal may always see what its own execution did.
+    pub fn execution_events(&self, access: &Access<'_>, view: ContentCapture) -> Result<Vec<Event>> {
         self.state.read().unwrap().verify_grant(self.domain, access)?;
         let Some(cause) = access.cause else {
             return Ok(Vec::new());
         };
         let journal = self.journal.lock().unwrap();
-        Ok(journal.events.iter().filter(|e| e.cause.is_some_and(|c| c.execution == cause.execution)).cloned().collect())
+        Ok(journal
+            .events
+            .iter()
+            .filter(|e| e.cause.is_some_and(|c| c.execution == cause.execution))
+            .map(|e| e.viewed(view))
+            .collect())
     }
 
     pub fn transaction(&self) -> Transaction<'_> {
@@ -768,7 +832,8 @@ impl Transaction<'_> {
             let version = match staging.creates.get(&object) {
                 Some(path) => {
                     st.insert(object, path, Body::Data { value, version: 1 });
-                    self.fs.record(&st.objects[&object].names, object, who, EventKind::Bound(path.clone()));
+                    let names = &st.objects[&object].names;
+                    self.fs.record_with(names, object, who, |capture| EventKind::Bound(capture.name(path)));
                     1
                 }
                 None => {
@@ -987,7 +1052,7 @@ mod tests {
         let a = access(&grants, 0).caused_by(cause);
         fs.invoke(&a, double, Value::Int(1)).unwrap();
 
-        let events = fs.execution_events(&a).unwrap();
+        let events = fs.execution_events(&a, ContentCapture::Omit).unwrap();
         assert_eq!(events.len(), 1);
         let e = &events[0];
         assert_eq!(
@@ -1042,5 +1107,36 @@ mod tests {
         let (a, _) = setup();
         let (b, _) = setup();
         assert_eq!(a.resolve(&p("/tools/double")), b.resolve(&p("/tools/double")));
+    }
+
+    #[test]
+    fn journal_records_names_only_as_captured_when_recorded() {
+        let (fs, host) = setup();
+        let r = root(&host);
+        let secret = fs.resolve(&p("/memory/secret")).unwrap(); // bound under the default, Omit
+
+        fs.set_journal_capture(&r, ContentCapture::Inline).unwrap();
+        let a = fs.bind(&r, &p("/state/inline-name"), Value::Null).unwrap();
+        fs.set_journal_capture(&r, ContentCapture::Omit).unwrap();
+        let b = fs.bind(&r, &p("/state/omitted-name"), Value::Null).unwrap();
+        fs.set_journal_capture(&r, ContentCapture::Inline).unwrap(); // later: reconstructs nothing
+
+        let bound = |events: &[Event], object| {
+            events.iter().find(|e| e.object == object && matches!(e.kind, EventKind::Bound(_))).unwrap().kind.clone()
+        };
+        let retained = fs.journal_retained(&r, &Path::root()).unwrap();
+        assert_eq!(bound(&retained, a), EventKind::Bound(CapturedValue::Inline(Value::from("/state/inline-name"))));
+        assert_eq!(bound(&retained, b), EventKind::Bound(CapturedValue::Omitted));
+        assert_eq!(bound(&retained, secret), EventKind::Bound(CapturedValue::Omitted));
+
+        let omitted = fs.journal(&r, &Path::root()).unwrap();
+        assert!(omitted.iter().all(|e| !matches!(e.kind, EventKind::Bound(CapturedValue::Inline(_)))));
+        assert!(!format!("{omitted:?}").contains("-name"), "the omitted view hides earlier inline records");
+
+        // Only host authority sets the policy or reads raw history.
+        let grants = fs.issue(&policy(), &AuthorityRequest::new("agent").want(p("/state/x"), Rights::WRITE)).unwrap();
+        let agent = access(&grants, 0);
+        assert!(fs.set_journal_capture(&agent, ContentCapture::Inline).is_err());
+        assert!(fs.journal_retained(&agent, &Path::root()).is_err());
     }
 }

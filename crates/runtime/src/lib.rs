@@ -59,39 +59,14 @@ impl Default for Limits {
     }
 }
 
-/// What a receipt may retain of the values that flowed through an
-/// execution. Chosen by the host; no program or capability can raise it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ContentCapture {
-    /// Keep identities, structure and statuses; drop every payload.
-    #[default]
-    Omit,
-    /// Keep payloads inline.
-    Inline,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum CapturedValue {
-    Omitted,
-    Inline(Value),
-}
-
-impl ContentCapture {
-    fn value(self, value: &Value) -> CapturedValue {
-        match self {
-            ContentCapture::Omit => CapturedValue::Omitted,
-            ContentCapture::Inline => CapturedValue::Inline(value.clone()),
-        }
-    }
-
-    fn text(self, text: String) -> Option<String> {
-        (self == ContentCapture::Inline).then_some(text)
-    }
-}
+/// The host's capture policy and the recorded form of content, shared with
+/// MeatFS so receipts and the journal follow one rule.
+pub use meatfs::{CapturedValue, ContentCapture};
 
 /// Why a program could not be loaded. Nothing has executed and the
-/// namespace is unchanged. Only `Authority` can carry source text (paths,
-/// capability messages); [`LoadError::render`] omits it unless revealed.
+/// namespace is unchanged. The record is made under the host's capture
+/// policy: under `Omit` it holds no source text (no paths, no capability
+/// messages), only kinds, node ids, rights and opaque identities.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadError {
     /// The IR violates a structural rule.
@@ -99,27 +74,38 @@ pub enum LoadError {
     /// A composition exceeds host limits.
     LimitExceeded { node: NodeId },
     /// Authority resolution failed: policy denial, unbound name, …
-    Authority(meatfs::Error),
+    Authority {
+        /// The MeatFS error variant, e.g. `PolicyDenied`.
+        kind: &'static str,
+        /// Content-free summary: kind, rights and opaque identities.
+        summary: String,
+        /// The full error, retained only under `Inline`.
+        detail: Option<String>,
+    },
 }
 
 impl LoadError {
-    /// Render for a diagnostic surface: with source text only if `reveal`.
-    pub fn render(&self, reveal: bool) -> String {
+    fn authority(e: meatfs::Error, capture: ContentCapture) -> LoadError {
+        LoadError::Authority { kind: e.kind(), summary: e.redacted(), detail: capture.text(|| e.to_string()) }
+    }
+
+    /// Render the record. Shows exactly what the record retained.
+    pub fn render(&self) -> String {
         match self {
             LoadError::InvalidGraph { node: Some(node), reason } => {
                 format!("load error InvalidGraph node={node}: {reason}")
             }
             LoadError::InvalidGraph { node: None, reason } => format!("load error InvalidGraph: {reason}"),
             LoadError::LimitExceeded { node } => format!("load error LimitExceeded node={node}"),
-            LoadError::Authority(e) if reveal => format!("load error Authority: {e}"),
-            LoadError::Authority(e) => format!("load error Authority: {}", e.redacted()),
+            LoadError::Authority { detail: Some(detail), .. } => format!("load error Authority: {detail}"),
+            LoadError::Authority { summary, .. } => format!("load error Authority: {summary}"),
         }
     }
 }
 
 impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render(true))
+        f.write_str(&self.render())
     }
 }
 
@@ -275,10 +261,16 @@ fn reaches(succs: &[Vec<usize>], from: usize, to: usize) -> bool {
 }
 
 /// Resolve a program into an executable graph under host `policy` and
-/// `limits`.
+/// `limits`. A failure is recorded under `capture`.
 ///
 /// Observational: on success or failure, the namespace is unchanged.
-pub fn load(fs: &MeatFs, policy: &Policy, limits: Limits, program: &Program) -> Result<Loaded, LoadError> {
+pub fn load(
+    fs: &MeatFs,
+    policy: &Policy,
+    limits: Limits,
+    capture: ContentCapture,
+    program: &Program,
+) -> Result<Loaded, LoadError> {
     let (mut preds, mut succs) = validate(&program.graph)?;
     for node in &program.graph.nodes {
         if let Op::Compose(expr) = &node.op {
@@ -287,7 +279,7 @@ pub fn load(fs: &MeatFs, policy: &Policy, limits: Limits, program: &Program) -> 
             }
         }
     }
-    let grants = fs.issue(policy, &program.request()).map_err(LoadError::Authority)?;
+    let grants = fs.issue(policy, &program.request()).map_err(|e| LoadError::authority(e, capture))?;
 
     // `request()` lists, per node, its target (if any) then its uses.
     let mut issued = grants.iter();
@@ -441,11 +433,31 @@ pub enum StagedChanges {
     RolledBack,
 }
 
+/// A grant target as a receipt records it: identities as they are, names
+/// only as the capture policy allows. The live grant keeps its real target.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordedTarget {
+    Object(ObjectId),
+    /// An unbound name the grant allowed creating.
+    Name(CapturedValue),
+    Namespace(CapturedValue),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrantRecord {
     pub grant: GrantId,
-    pub target: Target,
+    pub target: RecordedTarget,
     pub rights: Rights,
+}
+
+/// A graph output as a receipt records it, identified by its position in
+/// the graph's outputs; its name is source text and captured like content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputRecord {
+    pub index: usize,
+    pub name: CapturedValue,
+    pub source: NodeId,
+    pub value: CapturedValue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -488,8 +500,9 @@ pub struct ExecutionReceipt {
     /// Audit events caused by this execution, including discarded work.
     pub events: Vec<Event>,
     pub transaction: TxOutcome,
-    /// Graph outputs as captured; empty unless the transaction committed.
-    pub outputs: BTreeMap<String, CapturedValue>,
+    /// Graph outputs as recorded, in graph order; empty unless the
+    /// transaction committed.
+    pub outputs: Vec<OutputRecord>,
     /// The failure that rolled the execution back, if any.
     pub error: Option<ExecutionError>,
 }
@@ -588,7 +601,7 @@ impl Run<'_> {
             object,
             grant: resolved.grant,
             kind,
-            detail: self.capture.text(detail),
+            detail: self.capture.text(|| detail),
         }
     }
 
@@ -604,7 +617,7 @@ impl Run<'_> {
                     object: None,
                     grant: self.loaded.nodes[i].grant,
                     kind: ExecutionErrorKind::DependencyFailed,
-                    detail: self.capture.text(format!("depends on failed {}", self.loaded.nodes[failed].id)),
+                    detail: self.capture.text(|| format!("depends on failed {}", self.loaded.nodes[failed].id)),
                 });
                 stack.extend(&self.loaded.succs[i]);
             }
@@ -700,7 +713,7 @@ pub(crate) fn execute_with(
                 Ok(()) => TxOutcome::Committed,
                 Err(e) => {
                     let (kind, object) = classify(&e);
-                    let detail = capture.text(e.to_string());
+                    let detail = capture.text(|| e.to_string());
                     error = Some(ExecutionError { execution, node: None, object, grant: None, kind, detail });
                     TxOutcome::RolledBack
                 }
@@ -713,7 +726,7 @@ pub(crate) fn execute_with(
         .issued(0)
         .and_then(|g| loaded.grants.access(g.id()))
         .map(|a| a.caused_by(Cause { execution, node: NodeId(0) }))
-        .map_or_else(Vec::new, |a| fs.execution_events(&a).expect("the set's own grant is live"));
+        .map_or_else(Vec::new, |a| fs.execution_events(&a, capture).expect("the set's own grant is live"));
     let staged_by: BTreeSet<NodeId> =
         events.iter().filter(|e| e.kind == EventKind::Staged).filter_map(|e| e.cause.map(|c| c.node)).collect();
 
@@ -756,14 +769,36 @@ pub(crate) fn execute_with(
         grants: loaded
             .grants
             .iter()
-            .map(|g| GrantRecord { grant: g.id(), target: g.target().clone(), rights: g.rights() })
+            .map(|g| GrantRecord {
+                grant: g.id(),
+                target: match g.target() {
+                    Target::Object(o) => RecordedTarget::Object(*o),
+                    Target::Name(p) => RecordedTarget::Name(capture.name(p)),
+                    Target::Namespace(p) => RecordedTarget::Namespace(capture.name(p)),
+                },
+                rights: g.rights(),
+            })
             .collect(),
         derived_order: loaded.derived.clone(),
         nodes,
         schedule,
         events,
         transaction,
-        outputs: graph_outputs.iter().map(|(k, v)| (k.clone(), capture.value(v))).collect(),
+        outputs: match transaction {
+            TxOutcome::Committed => loaded
+                .graph
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(index, o)| OutputRecord {
+                    index,
+                    name: capture.label(&o.name),
+                    source: o.source,
+                    value: capture.value(&graph_outputs[&o.name]),
+                })
+                .collect(),
+            TxOutcome::RolledBack => Vec::new(),
+        },
         error,
     };
     ExecutionOutcome { outputs: graph_outputs, receipt }

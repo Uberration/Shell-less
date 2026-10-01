@@ -10,6 +10,7 @@
 //! over this model, not the model itself.
 
 mod authority;
+mod capture;
 mod error;
 mod fs;
 mod id;
@@ -20,6 +21,7 @@ mod value;
 pub use authority::{
     Access, AuthorityRequest, Cause, Constraints, Grant, GrantSet, NodeGrant, NodeGrants, Policy, Target,
 };
+pub use capture::{CapturedValue, ContentCapture};
 pub use error::{Error, Result};
 pub use fs::{
     CallContext, CapabilityMeta, Determinism, Effects, Event, EventKind, Fault, Inspection, InvocationMeta, Invoke,
